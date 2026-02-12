@@ -1,3 +1,363 @@
-# PanguS2S
+# Pangu S2S Training — Optimized for H100 and B300 (Blackwell) GPUs
 
-Pangu S2S (PI Pedram Hassanzadeh)
+This repository contains training scripts optimized for multi-GPU training on NVIDIA H100 and B300 GPUs:
+
+- **`faster_train.py`** — Production training with automatic H100/B300 optimization
+- **`code_profiling.py`** — Same as above + integrated PyTorch Profiler for performance analysis
+- **`b300_training.sh`** — Benchmark suite for B300 evaluation (runs `faster_train.py` across multiple dimensions)
+
+---
+
+## Quick Start
+
+### Production Training (`faster_train.py`)
+
+```bash
+torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  --master_port=29500 \
+  faster_train.py \
+  --yaml_config=config/exp1.yaml \
+  --run_num=1 \
+  --amp-dtype bf16 \
+  --torch-compile True \
+  --compile-mode max-autotune \
+  --ddp-static-graph \
+  --ddp-bucket-cap-mb 256 \
+  --ddp-fp16-compress \
+  --max-grad-norm 1.0 \
+  --log-every-n-steps 100 \
+  --metrics-every 500
+```
+
+The same script works on both H100 and B300. It auto-detects the GPU architecture and adjusts DDP bucket defaults accordingly. Training logic is identical on both platforms.
+
+### B300 Benchmark Suite (`b300_training.sh`)
+
+Edit the top of `b300_training.sh` to set paths and enable optional sections, then submit:
+
+```bash
+cd scripts
+sbatch b300_training.sh
+```
+
+Output goes to `b300_bench_*.out`. Run the same script on H100 first to get a baseline, then on B300 for comparison.
+
+### Profiling Mode (`code_profiling.py`)
+
+```bash
+torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  --master_port=29500 \
+  code_profiling.py \
+  --yaml_config=config/exp1.yaml \
+  --run_num=1 \
+  --amp-dtype bf16 \
+  --torch-compile True \
+  --compile-mode reduce-overhead \
+  --ddp-static-graph \
+  --ddp-bucket-cap-mb 256 \
+  --profiling \
+  --profile-wait-steps 5 \
+  --profile-warmup-steps 3 \
+  --profile-active-steps 10 \
+  --profile-memory \
+  --profile-with-stack \
+  --profile-with-flops
+```
+
+---
+
+## Benchmark Suite (`b300_training.sh`)
+
+The benchmark suite covers 7 sections. Each can be run on both H100 (Midway) and B300 to produce a direct comparison.
+
+### Section 1: Precision Sweep (4 GPU)
+
+Runs the same training with different precision to measure throughput and accuracy sensitivity.
+
+| Run | Precision | Purpose |
+|-----|-----------|---------|
+| BF16 Baseline | BF16 | Apples-to-apples with H100 |
+| FP16 | FP16 | Precision sensitivity |
+| FP8 | FP8 via Transformer Engine | Blackwell's main advantage (correctness test) |
+| FP32 with TF32 | FP32 + TF32 | Higher precision baseline |
+| FP32 pure | FP32 no TF32 | True FP32 reference |
+
+### Section 2: GPU Scaling (1, 2, 4 GPUs)
+
+Runs BF16 training with 1, 2, and 4 GPUs to measure DDP scaling efficiency and NVLink bandwidth impact.
+
+### Section 3: Batch Size Sweep (Memory Saturation)
+
+Scales batch size up to saturate GPU memory. Enable by editing `BATCH_SIZES` at the top of `b300_training.sh`:
+
+```bash
+BATCH_SIZES="4 8 16 32 64"
+```
+
+B300 has 288GB HBM3e vs H100's 80GB — this sweep finds where each architecture saturates.
+
+### Section 4: Data Loader — Local vs GPFS
+
+Compares training throughput when data is on local NVMe vs GPFS shared filesystem. Enable by editing both paths at the top of `b300_training.sh`:
+
+```bash
+DATA_DIR_GPFS=/project/pedramh/data
+DATA_DIR_LOCAL=/local/scratch/data
+```
+
+If either path is left empty, this section skips.
+
+### Section 5: nsys Profiling
+
+Profiles with NVIDIA Nsight Systems to capture kernel-level FLOPs, memory bandwidth (host-device, device-host, device-device), and DDP communication. Runs:
+
+- 1-GPU BF16 (clean traces, no DDP noise)
+- 4-GPU BF16 (captures all-reduce, NVLink traffic)
+- 1-GPU FP16 (precision comparison)
+
+Output: `nsys_*.nsys-rep` files. View with `nsys-ui` or extract stats with `nsys stats`.
+
+### Section 6: ncu Profiling
+
+Profiles with NVIDIA Nsight Compute for per-kernel FLOPs and memory throughput. Single GPU, slow (profiles 20 kernels after skipping 50 warmup launches).
+
+Output: `ncu_*.ncu-rep` files. View with `ncu-ui`.
+
+### Section 7: PyTorch Profiler
+
+Uses the built-in `--profiling` flag for Chrome traces with FLOP estimates. Runs at 1 GPU and 4 GPUs.
+
+Output: `profiler_traces/` directory with Chrome JSON traces.
+
+---
+
+## Script Overview
+
+### `faster_train.py` — Production Training
+
+A highly optimized distributed trainer featuring:
+
+- **`torch.compile` before DDP** — Enables better kernel fusion
+- **Double-buffered CUDA prefetcher** — Overlaps data loading with compute
+- **`max-autotune` compile mode** — Optimizes for H100/B300 tensor cores
+- **Optimized DDP** — Larger buckets (256MB H100 / 512MB B300), FP16 gradient compression, static graph
+- **Gradient accumulation** — Supports `--accum-steps` with `no_sync()` for reduced communication
+- **BF16/FP16/FP32 AMP** — Configurable precision with `--amp-dtype`
+- **FP8 AMP** — Optional, via Transformer Engine (Blackwell/Hopper only)
+- **GPU auto-detection** — Detects Hopper vs Blackwell and sets architecture-specific defaults
+- **Batch size override** — `--batch-size-override N` for memory saturation sweeps
+- **Data dir override** — `--data-dir-override /path` for local vs GPFS comparison
+- **Pure FP32 mode** — `--no-tf32` disables TF32 for true FP32 precision baseline
+
+### `code_profiling.py` — Training + Profiler
+
+Extends `faster_train.py` with integrated PyTorch Profiler:
+
+- **ProfilerManager class** — Manages profiler lifecycle and trace export
+- **MemoryProfiler class** — Tracks GPU memory at key points
+- **`record_function` annotations** — Marks `data_preparation`, `forward`, `backward`, `optimizer_step`
+- **Multi-format output** — Chrome traces, TensorBoard, and stack traces for flame graphs
+- **Automatic early exit** — Stops after profiling completes
+
+---
+
+## B300 (Blackwell) Support
+
+### What changed from the H100-only version
+
+The script auto-detects GPU architecture at startup via `torch.cuda.get_device_capability()` (SM ≥ 10 = Blackwell, SM 9 = Hopper). All changes are marked with `# B300:` comments in the code. On H100, the code runs identically to the original version.
+
+| Change | H100 (Hopper) | B300 (Blackwell) |
+|--------|---------------|------------------|
+| DDP bucket default | 256MB | 512MB (NVLink 5) |
+| FP8 support | Available (Hopper TE) | Available (Blackwell TE) |
+| torch.compile | SM_90 (works) | SM_103 (needs NGC container or Triton fix) |
+| AMP dtype options | bf16, fp16, fp32 | bf16, fp16, fp32, fp8 |
+
+NCCL buffer sizes, IB settings, and all other environment variables are set identically on both architectures (via `b300_training.sh`). The python code uses `os.environ.setdefault()` so the shell values take priority.
+
+### FP8 Training
+
+FP8 is enabled with `--amp-dtype fp8` and requires NVIDIA Transformer Engine:
+
+```bash
+pip install transformer_engine[pytorch]
+```
+
+**Important:** Full FP8 speedup requires swapping `nn.Linear` layers in PanguModel_Plasim to `te.Linear`. The current FP8 run is a correctness test and baseline for that future work.
+
+### torch.compile on Blackwell
+
+Stock PyTorch (as of 2.9.x) ships a Triton bundle that may not support SM_103 (Blackwell Ultra). If you see:
+
+```
+ptxas fatal : Value 'sm_103a' is not defined for option 'gpu-name'
+```
+
+Options:
+1. Use the NGC container (`nvcr.io/nvidia/pytorch:25.04-py3` or later) — recommended
+2. Build Triton from source with SM_103 support
+3. Run with `--torch-compile False` (slower but works)
+
+The script handles this gracefully — it prints the error and continues without `torch.compile`.
+
+### B300 Software Requirements
+
+| Component | Minimum Version | Notes |
+|-----------|----------------|-------|
+| CUDA Toolkit | 12.8+ (ideally 13.0) | SM_103 support required |
+| NVIDIA Driver | 580+ | Blackwell Ultra support |
+| PyTorch | 2.7+ (nightly recommended) | Triton SM_103 workaround may be needed |
+| Transformer Engine | 1.5+ | Optional, for FP8 training |
+| NCCL | 2.24+ | NVLink 5 optimizations |
+| Nsight Systems | 2024.x+ | For nsys profiling |
+| Nsight Compute | 2024.x+ | For ncu profiling (per-kernel) |
+| NGC Container | `nvcr.io/nvidia/pytorch:25.04-py3` | Easiest path — everything pre-integrated |
+
+---
+
+## Key Command-Line Arguments
+
+### Common (both scripts)
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--yaml_config` | `config/PANGU_S2S.yaml` | Path to YAML config |
+| `--amp-dtype` | `bf16` | Precision: `bf16`, `fp16`, `fp8`, or `fp32` |
+| `--no-tf32` | `False` | Disable TF32 for pure FP32 baseline |
+| `--torch-compile` | `True` | Enable `torch.compile` |
+| `--compile-mode` | `max-autotune` | Compile mode |
+| `--ddp-static-graph` | `True` | Enable DDP static graph |
+| `--ddp-bucket-cap-mb` | auto | DDP bucket size (256 Hopper, 512 Blackwell) |
+| `--ddp-fp16-compress` | `True` | Enable gradient compression |
+| `--accum-steps` | `1` | Gradient accumulation steps |
+| `--max-grad-norm` | `1.0` | Gradient clipping (0 to disable) |
+| `--log-every-n-steps` | `50` | Logging frequency |
+| `--metrics-every` | `200` | Expensive metrics frequency |
+| `--batch-size-override` | None | Override batch size from YAML (memory sweep) |
+| `--data-dir-override` | None | Override data directory (local vs GPFS) |
+| `--gradient-checkpointing` | `False` | Trade compute for memory |
+
+### Profiler-only (`code_profiling.py`)
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--profiling` | `False` | Enable profiler mode |
+| `--profile-wait-steps` | `5` | Steps to skip before profiling |
+| `--profile-warmup-steps` | `3` | Profiler warmup steps |
+| `--profile-active-steps` | `10` | Steps to actively profile |
+| `--profile-repeat` | `1` | Number of profiling cycles |
+| `--profile-memory` | `True` | Profile memory usage |
+| `--profile-with-stack` | `True` | Record stack traces |
+| `--profile-with-flops` | `True` | Estimate FLOPS |
+| `--profile-disable-compile` | `False` | Disable compile for clearer traces |
+
+---
+
+## Metrics Collected
+
+| Tool | FLOPs | Host↔Device BW | Device↔Device BW | Kernel Time | Memory Usage |
+|------|-------|----------------|-------------------|-------------|-------------|
+| nsys | via kernel analysis | ✅ | ✅ (NVLink) | ✅ | ✅ |
+| ncu | ✅ (per kernel) | ✅ | ✅ | ✅ | ✅ |
+| PyTorch Profiler | ✅ (estimated) | partial | partial | ✅ | ✅ |
+| Training logs | ❌ | ❌ | ❌ | ✅ (step time) | ✅ (peak) |
+
+---
+
+## Comparison: `faster_train.py` vs `code_profiling.py`
+
+| Feature | `faster_train.py` | `code_profiling.py` |
+|---------|-------------------|---------------------|
+| Production training | ✅ | ✅ |
+| H100 + B300 support | ✅ | ✅ |
+| torch.compile | ✅ | ✅ |
+| FP8 via Transformer Engine | ✅ | ✅ |
+| Batch size / data dir override | ✅ | ✅ |
+| **PyTorch Profiler** | ❌ | ✅ |
+| **ProfilerManager** | ❌ | ✅ |
+| **Chrome trace export** | ❌ | ✅ |
+| **Flame graph support** | ❌ | ✅ |
+
+---
+
+## Viewing Profiler Results
+
+**nsys reports:**
+```bash
+nsys stats nsys_bf16_1gpu.nsys-rep --report cuda_gpu_kern_sum
+nsys stats nsys_bf16_1gpu.nsys-rep --report cuda_gpu_mem_size_sum
+# or open in nsys-ui for interactive timeline
+```
+
+**ncu reports:**
+```bash
+ncu-ui ncu_bf16.ncu-rep
+# or command-line summary:
+ncu --import ncu_bf16.ncu-rep --page details
+```
+
+**PyTorch Chrome traces:**
+```bash
+# Open chrome://tracing in Chrome, then load:
+# profiler_traces/trace_rank0_*.json
+```
+
+**TensorBoard:**
+```bash
+tensorboard --logdir=<exp_dir>/profiler_traces
+```
+
+---
+
+## Environment Variables (Auto-configured)
+
+Both `b300_training.sh` and the original H100 sbatch set identical environment variables. The python code uses `os.environ.setdefault()` as a fallback so shell values always take priority.
+
+```bash
+# NCCL optimizations
+NCCL_DEBUG=WARN
+NCCL_P2P_LEVEL=5               # Full NVLink P2P
+NCCL_P2P_DISABLE=0
+NCCL_SHM_DISABLE=0
+NCCL_NET_GDR_LEVEL=5           # Max GPU Direct RDMA
+NCCL_IB_DISABLE=0
+NCCL_IB_GID_INDEX=3
+NCCL_IB_TIMEOUT=23
+NCCL_IB_RETRY_CNT=7
+NCCL_SOCKET_IFNAME=^lo,docker0
+NCCL_SOCKET_NTHREADS=8
+NCCL_NSOCKS_PERTHREAD=4
+NCCL_BUFFSIZE=16777216         # 16MB buffer
+NCCL_NTHREADS=512
+NCCL_MAX_NCHANNELS=32
+
+# CUDA optimizations
+CUDA_LAUNCH_BLOCKING=0
+TORCH_CUDNN_V8_API_ENABLED=1
+CUDA_DEVICE_MAX_CONNECTIONS=1
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+NVIDIA_TF32_OVERRIDE=1
+
+# Python
+TOKENIZERS_PARALLELISM=false
+PYTHONHASHSEED=0
+WANDB_MODE=offline
+```
+
+---
+
+## Future Work
+
+- [ ] **FP8 model layers** — Swap `nn.Linear` to `te.Linear` in PanguModel_Plasim for full FP8 speedup on Blackwell
+- [ ] **MXFP8 training** — Block-level scaling via TorchAO (hardware-native on Blackwell, up to 1.3x over BF16)
+- [ ] **FSDP integration** — For models that don't fit in single-GPU memory
+- [ ] **Activation checkpointing** — Trade compute for memory on very large models
+- [ ] **Automated profiler analysis** — Parse traces and suggest optimizations
+- [ ] **Multi-node support** — Extend optimizations for multi-node training
+- [ ] **Dynamic batching** — Adjust batch size based on available memory (especially with B300's 288GB)
+- [ ] **Profiler-guided compile** — Use profiling data to inform `torch.compile` decisions
