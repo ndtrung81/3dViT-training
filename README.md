@@ -1,10 +1,15 @@
 # Pangu S2S Training — Optimized for H100 and B300 (Blackwell) GPUs
 
-This repository contains training scripts optimized for multi-GPU training on NVIDIA H100 and B300 GPUs:
+This repository contains training scripts Youzhi Yu optimized for multi-GPU training on NVIDIA H100 and B300 GPUs:
 
 - **`faster_train.py`** — Production training with automatic H100/B300 optimization
 - **`code_profiling.py`** — Same as above + integrated PyTorch Profiler for performance analysis
 - **`b300_training.sh`** — Benchmark suite for B300 evaluation (runs `faster_train.py` across multiple dimensions)
+
+The code trains a 3D-vision Transformer from the dataset provided by PI Pedram Hassandazeh (Geophysical Sciences) for weather modeling. The `Pangu_Plasim` model is implemented in `networks/pangu.py` based on the article
+`Pangu-Weather: A 3D High-Resolution Model for Fast and Accurate Global Weather Forecast` (https://arxiv.org/abs/2211.02556).
+
+The training dataset contains multi-channel 2D images, each essentially a multi-dimensional array, over many years.
 
 ---
 
@@ -90,9 +95,9 @@ Runs the same training with different precision to measure throughput and accura
 
 Runs BF16 training with 1, 2, and 4 GPUs to measure DDP scaling efficiency and NVLink bandwidth impact.
 
-### Section 3: Batch Size Sweep (Memory Saturation)
+### Section 3: Batch Size Sweep
 
-Scales batch size up to saturate GPU memory. Enable by editing `BATCH_SIZES` at the top of `b300_training.sh`:
+Scales batch size up to saturate GPU compute capacity (i.e., keeping all the SMs busy) and memory. Enable by editing `BATCH_SIZES` at the top of `b300_training.sh`:
 
 ```bash
 BATCH_SIZES="4 8 16 32 64"
