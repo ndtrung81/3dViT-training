@@ -91,13 +91,17 @@ Runs the same training with different precision to measure throughput and accura
 | FP32 with TF32 | FP32 + TF32 | Higher precision baseline |
 | FP32 pure | FP32 no TF32 | True FP32 reference |
 
+Note that each B300 (Blackwell) GPU has 2 processors (like each AMD MI250X has 2 GCDs and each Intel PVC has 2 stacks). Each processor of the B300 GPU has 148 streaming multiprocessors (SMs), 592 Tensor Cores and 144 GB (HBM3e) memory at 4.1 TB/s bandwidth.
+
+For comparison, each H100 (Hopper) GPU has 1 processor, 114 SMs, 456 Tensor Cores, and 80 GB (HBM2e) memory and 2.0 TB/s bandwidth.
+
 ### Section 2: GPU Scaling (1, 2, 4 GPUs)
 
 Runs BF16 training with 1, 2, and 4 GPUs to measure DDP scaling efficiency and NVLink bandwidth impact.
 
 ### Section 3: Batch Size Sweep
 
-Scales batch size up to saturate GPU compute capacity (i.e., keeping all the SMs busy) and memory. Enable by editing `BATCH_SIZES` at the top of `b300_training.sh`:
+Scales batch size up to saturate GPU compute capacity (i.e., keeping all the SMs and Tensor Cores busy) and use up a significant fraction of GPU memory. Enable by editing `BATCH_SIZES` at the top of `b300_training.sh`:
 
 ```bash
 BATCH_SIZES="4 8 16 32 64"
