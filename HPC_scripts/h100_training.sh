@@ -1,44 +1,35 @@
 #!/bin/bash -l
 # ============================================================================
 #
-# B300 (Blackwell) BENCHMARK SUITE  —  Comparison against H100 (Hopper)
+# H100 BENCHMARK SUITE  —  Baseline for comparison against B300 (Blackwell)
 #
-# Runs faster_train.py on NVIDIA B300 GPUs across four benchmark dimensions,
-# mirroring the H100 benchmark suite for direct comparison:
+# Runs faster_train.py on NVIDIA H100 GPUs across four benchmark dimensions:
 #
-#   TASK 1 — Precision Sweep (4x B300, batch_size=8)
+#   TASK 1 — Precision Sweep (4x H100, batch_size=8)
 #            BF16, FP16, FP32 with TF32, FP32 pure (no TF32)
-#            + FP8 via Transformer Engine (Blackwell-only, bonus comparison)
 #            Measures: seconds per iteration for each precision mode.
 #
-#   TASK 2 — Batch Size Sweep (4x B300, BF16)
+#   TASK 2 — Batch Size Sweep (4x H100, BF16)
 #            batch_size = 8, 16, 32
 #            Measures: seconds per iteration to find memory saturation point.
 #
-#   TASK 3 — Data Location (4x B300, batch_size=8, BF16)
+#   TASK 3 — Data Location (4x H100, batch_size=8, BF16)
 #            Local NVMe storage vs GPFS
 #            Measures: seconds per iteration to isolate I/O bottleneck.
 #
-#   TASK 4 — GPU Scaling (B300, batch_size=16, BF16)
+#   TASK 4 — GPU Scaling (H100, batch_size=16, BF16)
 #            1, 2, 4 GPUs
 #            Measures: seconds per iteration to assess multi-GPU scaling.
 #            NOTE: The 1-GPU run skips DDP wrapping (no allreduce overhead).
 #
-# Key differences from H100 script:
-#   - DDP bucket size: 512 MB (vs 256 MB on H100) — Blackwell has NVLink 5
-#     with higher bandwidth, so larger buckets reduce allreduce round-trips.
-#   - FP8 precision test via NVIDIA Transformer Engine (Blackwell SM_100+).
-#   - NCCL buffer/channel settings tuned for Blackwell's wider NVLink.
-#
 # Usage:
-#   sbatch b300_training.sh                              # submit to SLURM
-#   bash b300_training.sh 2>&1 | tee b300_results.log   # interactive run
+#   sbatch h100_training.sh                              # submit to SLURM
+#   bash h100_training.sh 2>&1 | tee h100_results.log   # interactive run
 #
 # Output:
-#   - SLURM .out/.err files (or b300_results.log if run interactively)
+#   - SLURM .out/.err files (or h100_results.log if run interactively)
 #   - Per-run timing printed to stdout: "Duration: Xs (Y.Zm)"
 #   - profiler_traces/ directory if PyTorch Profiler tasks are enabled
-#   - nsys_*.nsys-rep / ncu_*.ncu-rep if profiling sections are uncommented
 #
 # ============================================================================
 #SBATCH --account=pi-pedramh
@@ -49,8 +40,8 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
-#SBATCH -o b300_bench_%x_%j.out
-#SBATCH -e b300_bench_%x_%j.err
+#SBATCH -o h100_bench_%x_%j.out
+#SBATCH -e h100_bench_%x_%j.err
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=youzhi@rcc.uchicago.edu
 
@@ -71,7 +62,7 @@ YAML_CONFIG="${YAML_CONFIG:-../config/exp1.yaml}"
 RUN_NUM="${RUN_NUM:-99}"
 
 # Temp file for collecting results
-RESULTS_FILE=$(mktemp /tmp/b300_bench_results.XXXXXX)
+RESULTS_FILE=$(mktemp /tmp/h100_bench_results.XXXXXX)
 trap "rm -f $RESULTS_FILE" EXIT
 
 # ------------------------------------
@@ -90,11 +81,10 @@ export MPICH_GPU_SUPPORT_ENABLED=1
 ulimit -l unlimited
 
 # ============================================================================
-# NCCL optimizations for B300 (Blackwell, NVLink 5, SM_100+)
+# NCCL optimizations for H100 (Hopper, NVLink 4, SM_90)
 #
-# Blackwell has 2x the NVLink bandwidth of Hopper (1.8 TB/s vs 900 GB/s),
-# so we use larger buffers and more channels to saturate the link.
-# These settings are otherwise identical to the H100 script for consistency.
+# These match the original midway_training.sh sbatch script.
+# All settings are tuned for 4x H100 SXM on a single node with NVLink.
 # ============================================================================
 export NCCL_DEBUG=WARN                   # Use INFO for debugging, WARN for benchmarks
 export NCCL_P2P_LEVEL=5                  # Full NVLink peer-to-peer
@@ -108,14 +98,14 @@ export NCCL_IB_RETRY_CNT=7              # IB retries before failure
 export NCCL_SOCKET_IFNAME=^lo,docker0   # Exclude loopback and docker interfaces
 export NCCL_SOCKET_NTHREADS=8           # Socket threads for CPU-side NCCL ops
 export NCCL_NSOCKS_PERTHREAD=4          # Sockets per NCCL thread
-export NCCL_BUFFSIZE=16777216           # 16 MB NCCL buffer
+export NCCL_BUFFSIZE=16777216           # 16 MB NCCL buffer (default for H100)
 export NCCL_NTHREADS=512                # NCCL GPU threads
 export NCCL_MAX_NCHANNELS=32            # Max NCCL channels
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_DISTRIBUTED_DEBUG=OFF       # OFF for benchmarks (DETAIL for debugging)
 
 # ============================================================================
-# CUDA optimizations for B300
+# CUDA optimizations for H100
 # ============================================================================
 export CUDA_LAUNCH_BLOCKING=0                       # Async kernel launches
 export TORCH_CUDNN_V8_API_ENABLED=1                 # cuDNN v8 graph API
@@ -155,7 +145,7 @@ fi
 # ============================================================================
 echo ""
 echo "========================================================================"
-echo "  B300 (Blackwell) BENCHMARK SUITE — System Info"
+echo "  H100 BENCHMARK SUITE — System Info"
 echo "  $(date)"
 echo "========================================================================"
 echo ""
@@ -168,18 +158,13 @@ echo ""
 echo "=== Cluster Info ==="
 echo "NUM_OF_NODES= ${SLURM_JOB_NUM_NODES:-1}  AVAILABLE_GPUS= ${AVAILABLE_GPUS}"
 echo ""
-echo "=== PyTorch / CUDA / Transformer Engine ==="
+echo "=== PyTorch / CUDA ==="
 python3 -c "
 import torch
 print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}, {torch.cuda.device_count()} GPUs')
 for i in range(torch.cuda.device_count()):
     p = torch.cuda.get_device_properties(i)
     print(f'  GPU {i}: {p.name}, {p.total_mem/1e9:.1f} GB, SM {p.major}.{p.minor}')
-try:
-    import transformer_engine
-    print(f'Transformer Engine: {transformer_engine.__version__} (FP8 supported)')
-except ImportError:
-    print('Transformer Engine: NOT installed (FP8 runs will fall back to BF16)')
 " 2>/dev/null || true
 echo ""
 
@@ -217,7 +202,7 @@ run_training() {
     echo ""
 
     local start_time=$(date +%s)
-    local _run_log=$(mktemp /tmp/b300_run.XXXXXX)
+    local _run_log=$(mktemp /tmp/h100_run.XXXXXX)
 
     # Run training. Stdout goes to both terminal (SLURM .out) and _run_log.
     # Stderr goes to SLURM .err as normal.
@@ -281,117 +266,92 @@ fi
 # ------------------------------------
 COMMON="--epochs 1 --max-steps 50 --fresh_start --ddp-static-graph --max-grad-norm 1.0 --log-every-n-steps 100 --metrics-every 500 --accum-steps 1"
 
-# ------------------------------------
-# B300-specific: DDP bucket size is 512 MB (vs 256 MB on H100).
-# Blackwell's NVLink 5 has ~2x the bandwidth, so larger buckets
-# reduce the number of allreduce round-trips without stalling.
-# ------------------------------------
-B300_BUCKET_MB=512
-
 
 # ============================================================================
 # TASK 1: PRECISION SWEEP
 #
 # Measures: Seconds per iteration across precision modes
-# Config:   4x B300, batch_size=8 (default from YAML)
+# Config:   4x H100, batch_size=8 (default from YAML)
 # Precisions tested:
-#   - BF16      : Default mixed precision (fast on Blackwell Tensor Cores)
-#   - FP16      : FP16 mixed precision with loss scaling
-#   - FP32+TF32 : Full FP32 but TF32 hardware acceleration enabled
-#   - FP32 pure : FP32 with TF32 disabled (slowest, reference baseline)
-#   - FP8 (bonus): FP8 via NVIDIA Transformer Engine (Blackwell-only feature)
+#   - BF16     : Default mixed precision (fastest on H100)
+#   - FP16     : FP16 mixed precision with loss scaling
+#   - FP32+TF32: Full FP32 but TF32 hardware acceleration enabled
+#   - FP32 pure: FP32 with TF32 disabled (slowest, reference baseline)
 #
-# FP8 notes:
-#   - Requires transformer_engine pip package.
-#   - Uses te.fp8_autocast() around the forward pass.
-#   - Full FP8 speedup requires replacing nn.Linear with te.Linear in the model.
-#     This run tests correctness and provides a baseline for future TE integration.
-#   - If Transformer Engine is not installed, this run falls back to BF16 automatically.
+# NOTE: FP8 is NOT tested on H100. FP8 via Transformer Engine is only
+#       meaningful on Blackwell (B300). The B300 script includes FP8.
 # ============================================================================
 
-sep "TASK 1: PRECISION SWEEP (4x B300, batch_size=8)"
+sep "TASK 1: PRECISION SWEEP (4x H100, batch_size=8)"
 
-# BF16 — the recommended precision for Blackwell.
+# BF16 — the recommended precision for H100.
 # Uses torch.amp autocast with bfloat16. No loss scaling needed.
 run_training "Precision: BF16" \
     $MAX_GPUS \
-    "--amp-dtype bf16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress $COMMON" \
+    "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress $COMMON" \
     29500
 
 # FP16 — uses torch.amp autocast with float16.
 # Requires GradScaler for loss scaling to avoid underflow.
 run_training "Precision: FP16" \
     $MAX_GPUS \
-    "--amp-dtype fp16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress $COMMON" \
+    "--amp-dtype fp16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress $COMMON" \
     29501
 
 # FP32 with TF32 — full 32-bit accumulation, but matmuls use TF32 hardware paths.
+# TF32 gives ~2x speedup over pure FP32 on H100 Tensor Cores with minimal accuracy loss.
 run_training "Precision: FP32 with TF32" \
     $MAX_GPUS \
-    "--amp-dtype fp32 --ddp-bucket-cap-mb $B300_BUCKET_MB $COMMON" \
+    "--amp-dtype fp32 --ddp-bucket-cap-mb 256 $COMMON" \
     29502
 
 # FP32 pure (no TF32) — the slowest reference baseline.
 # --no-tf32 disables TF32 in matmul and cuDNN, sets float32_matmul_precision='highest'.
+# Useful to quantify how much TF32 helps on H100.
 run_training "Precision: FP32 pure (no TF32)" \
     $MAX_GPUS \
-    "--amp-dtype fp32 --no-tf32 --ddp-bucket-cap-mb $B300_BUCKET_MB $COMMON" \
+    "--amp-dtype fp32 --no-tf32 --ddp-bucket-cap-mb 256 $COMMON" \
     29503
-
-# FP8 via Transformer Engine — Blackwell-only bonus test.
-# If Transformer Engine is not installed, faster_train.py will log a warning
-# and fall back to BF16 automatically (check logs for "Falling back to BF16").
-run_training "Precision: FP8 (Transformer Engine)" \
-    $MAX_GPUS \
-    "--amp-dtype fp8 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress $COMMON" \
-    29504
 
 
 # ============================================================================
 # TASK 2: BATCH SIZE SWEEP
 #
 # Measures: Seconds per iteration at different global batch sizes
-# Config:   4x B300, BF16 precision
+# Config:   4x H100, BF16 precision
 # Batch sizes: 4, 8, 12 (per-GPU: 1, 2, 3)
 #
-# NOTE: With num_ensemble_members=4, the model uses ~90 GB per GPU at
-#       per-GPU batch=2 on H100. B300 has ~192 GB VRAM so larger batches
-#       may fit. We start conservatively and match H100 sizes for comparison.
-#       If B300 handles these, try uncommenting larger sizes below.
+# NOTE: With num_ensemble_members=4, this model uses ~90 GB per GPU at
+#       per-GPU batch=2. Larger per-GPU batches (4+) OOM on H100 93 GB.
+#       So we test: global 4 (per-GPU=1), 8 (per-GPU=2), 12 (per-GPU=3).
 # ============================================================================
 
-sep "TASK 2: BATCH SIZE SWEEP (4x B300, BF16)"
+sep "TASK 2: BATCH SIZE SWEEP (4x H100, BF16)"
 
-# global_batch=4 — per-GPU=1.
+# global_batch=4 — per-GPU=1. Minimal batch, tests kernel launch overhead.
 run_training "BatchSize: 4" \
     $MAX_GPUS \
-    "--amp-dtype bf16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress --batch-size-override 4 $COMMON" \
+    "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 4 $COMMON" \
     29510
 
 # global_batch=8 — per-GPU=2. This is the YAML default.
 run_training "BatchSize: 8" \
     $MAX_GPUS \
-    "--amp-dtype bf16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress --batch-size-override 8 $COMMON" \
+    "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 8 $COMMON" \
     29511
 
-# global_batch=12 — per-GPU=3. Tests memory headroom.
+# global_batch=12 — per-GPU=3. Tests memory headroom near the OOM boundary.
 run_training "BatchSize: 12" \
     $MAX_GPUS \
-    "--amp-dtype bf16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress --batch-size-override 12 $COMMON" \
+    "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 12 $COMMON" \
     29512
-
-# Uncomment for B300-only larger batch tests (likely OOM on H100):
-# run_training "BatchSize: 16" \
-#     $MAX_GPUS \
-#     "--amp-dtype bf16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress --batch-size-override 16 $COMMON" \
-#     29513
 
 
 # ============================================================================
 # TASK 3: DATA LOCATION — Local NVMe vs GPFS
 #
 # Measures: Seconds per iteration from different storage backends
-# Config:   4x B300, batch_size=8, BF16
+# Config:   4x H100, batch_size=8, BF16
 #
 # Purpose: Isolate I/O bottleneck. If local NVMe is significantly faster
 #          than GPFS, the training is I/O-bound and would benefit from
@@ -402,18 +362,18 @@ run_training "BatchSize: 12" \
 # ============================================================================
 
 if [ -n "$DATA_DIR_LOCAL" ] && [ -n "$DATA_DIR_GPFS" ]; then
-    sep "TASK 3: DATA LOCATION — Local NVMe vs GPFS (4x B300, batch_size=8)"
+    sep "TASK 3: DATA LOCATION — Local NVMe vs GPFS (4x H100, batch_size=8)"
 
     # GPFS — network-attached parallel filesystem (default for most HPC jobs)
     run_training "DataLoc: GPFS" \
         $MAX_GPUS \
-        "--amp-dtype bf16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress --data-dir-override $DATA_DIR_GPFS $COMMON" \
+        "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --data-dir-override $DATA_DIR_GPFS $COMMON" \
         29520
 
     # Local NVMe — node-local SSD (fastest possible I/O, but data must be staged)
     run_training "DataLoc: Local NVMe" \
         $MAX_GPUS \
-        "--amp-dtype bf16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress --data-dir-override $DATA_DIR_LOCAL $COMMON" \
+        "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --data-dir-override $DATA_DIR_LOCAL $COMMON" \
         29521
 
 else
@@ -428,32 +388,33 @@ fi
 # TASK 4: GPU SCALING
 #
 # Measures: Seconds per iteration with 1, 2, 4 GPUs
-# Config:   B300, BF16, per-GPU batch_size=2 (kept constant)
+# Config:   H100, BF16, per-GPU batch_size=2 (kept constant)
 #
 # Purpose: Measure how well training scales across GPUs.
 #   - 1 GPU:  global_batch=2 (per-GPU=2). Pure compute, no allreduce.
-#   - 2 GPU:  global_batch=4 (per-GPU=2). Tests NVLink 5 scaling.
+#   - 2 GPU:  global_batch=4 (per-GPU=2). Tests NVLink scaling.
 #   - 4 GPU:  global_batch=8 (per-GPU=2). Full node scaling.
 #
 # We keep per-GPU batch_size constant at 2 to isolate the effect of
 # DDP communication overhead from batch size differences.
+# Ideal: 4 GPU should process 4x the global batch in the same wall time.
 # ============================================================================
 
-sep "TASK 4: GPU SCALING (B300, per-GPU batch=2, BF16)"
+sep "TASK 4: GPU SCALING (H100, per-GPU batch=2, BF16)"
 
 # 1 GPU — no DDP communication overhead.
-# global_batch=2 so per-GPU=2.
+# global_batch=2 so per-GPU=2 (fits in 93 GB).
 run_training "GPUScale: 1 GPU" \
     1 \
     "--amp-dtype bf16 --batch-size-override 2 $COMMON" \
     29530
 
-# 2 GPUs — tests NVLink 5 scaling.
+# 2 GPUs — tests NVLink scaling.
 # global_batch=4 so per-GPU=2.
 if [ "$MAX_GPUS" -ge 2 ]; then
     run_training "GPUScale: 2 GPU" \
         2 \
-        "--amp-dtype bf16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress --batch-size-override 4 $COMMON" \
+        "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 4 $COMMON" \
         29531
 fi
 
@@ -462,7 +423,7 @@ fi
 if [ "$MAX_GPUS" -ge 4 ]; then
     run_training "GPUScale: 4 GPU" \
         4 \
-        "--amp-dtype bf16 --ddp-bucket-cap-mb $B300_BUCKET_MB --ddp-fp16-compress --batch-size-override 8 $COMMON" \
+        "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 8 $COMMON" \
         29532
 fi
 
@@ -474,7 +435,7 @@ fi
 # and memory transfers. Output is a .nsys-rep file viewable in nsys-ui.
 # ============================================================================
 
-# Uncomment the block below to enable nsys profiling on B300:
+# Uncomment the block below to enable nsys profiling on H100:
 #
 # if command -v nsys &>/dev/null; then
 #     sep "OPTIONAL: NSYS PROFILING (1 GPU, BF16)"
@@ -483,7 +444,7 @@ fi
 #         --trace=cuda,nvtx,osrt,cudnn,cublas \
 #         --cuda-memory-usage=true \
 #         --gpu-metrics-device=all \
-#         --output="nsys_b300_bf16_1gpu" \
+#         --output="nsys_h100_bf16_1gpu" \
 #         --force-overwrite=true \
 #         torchrun --standalone --nproc_per_node=1 --master_port=29550 \
 #             $TRAIN_SCRIPT --yaml_config=$YAML_CONFIG --run_num=$RUN_NUM \
@@ -500,7 +461,7 @@ fi
 # Output: <experiment_dir>/profiler_traces/*.json
 # ============================================================================
 
-# Uncomment the block below to enable PyTorch Profiler on B300:
+# Uncomment the block below to enable PyTorch Profiler on H100:
 #
 # sep "OPTIONAL: PYTORCH PROFILER (1 GPU, BF16)"
 # run_training "PyTorch Profiler: BF16 1GPU" \
@@ -517,11 +478,12 @@ fi
 # DONE — Results Table
 # ============================================================================
 
-sep "ALL B300 BENCHMARKS COMPLETE"
+# Flush stdout so the .out file has all BENCHMARK_RESULT lines before we grep it
+sep "ALL H100 BENCHMARKS COMPLETE"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════════════════════════╗"
-echo "║                          B300 BENCHMARK RESULTS TABLE                               ║"
+echo "║                          H100 BENCHMARK RESULTS TABLE                               ║"
 echo "╠════════════════════════════════════╦════════╦══════════╦════════════╦════════════════╣"
 echo "║ Run Name                           ║ Status ║ Wall (s) ║ sec/step   ║ samples/sec    ║"
 echo "╠════════════════════════════════════╬════════╬══════════╬════════════╬════════════════╣"
@@ -548,4 +510,4 @@ echo "  - FAIL runs hit CUDA OOM or other errors (check .err file for details)"
 echo "  - All runs used 50 training steps (--max-steps 50) for timing consistency"
 echo ""
 nvidia-smi 2>/dev/null || true
-echo "=== B300 Benchmarks Complete ==="
+echo "=== H100 Benchmarks Complete ==="
