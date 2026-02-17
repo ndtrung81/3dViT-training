@@ -124,7 +124,7 @@ export PYTHONHASHSEED=0                 # Reproducible hash ordering
 # NOTE: set +u is needed because conda activation scripts reference unbound
 #       variables (e.g. ADDR2LINE), which would fail under 'set -u'.
 # ============================================================================
-ml python
+module load python cuda/12.2
 set +u
 source activate /project/pedramh/bing/env
 set -u
