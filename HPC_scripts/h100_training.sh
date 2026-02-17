@@ -445,6 +445,7 @@ if command -v nsys &>/dev/null; then
         --cuda-memory-usage=true \
         --gpu-metrics-device=all \
         --output="nsys_h100_bf16_1gpu" \
+        --duration=300 \
         --force-overwrite=true \
         torchrun --standalone --nproc_per_node=1 --master_port=29550 \
             $TRAIN_SCRIPT --yaml_config=$YAML_CONFIG --run_num=$RUN_NUM \
