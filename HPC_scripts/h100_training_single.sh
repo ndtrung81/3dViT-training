@@ -42,8 +42,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH -o h100_bench_%x_%j.out
 #SBATCH -e h100_bench_%x_%j.err
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=youzhi@rcc.uchicago.edu
+###SBATCH --mail-type=ALL
+###SBATCH --mail-user=youzhi@rcc.uchicago.edu
 
 # Exit on undefined variables; propagate pipeline failures
 set -uo pipefail
@@ -63,7 +63,7 @@ RUN_NUM="${RUN_NUM:-99}"
 
 # Temp file for collecting results
 RESULTS_FILE=$(mktemp /tmp/h100_bench_results.XXXXXX)
-trap "rm -f $RESULTS_FILE" EXIT
+#trap "rm -f $RESULTS_FILE" EXIT
 
 # ------------------------------------
 # TASK 3 config: Data location comparison
@@ -202,7 +202,8 @@ run_training() {
     echo ""
 
     local start_time=$(date +%s)
-    local _run_log=$(mktemp /tmp/h100_run.XXXXXX)
+    #local _run_log=$(mktemp /tmp/h100_run.XXXXXX)
+    local _run_log=h100_run.$port
 
     # Run training. Stdout goes to both terminal (SLURM .out) and _run_log.
     # Stderr goes to SLURM .err as normal.
@@ -266,7 +267,6 @@ fi
 # ------------------------------------
 COMMON="--epochs 1 --max-steps 50 --fresh_start --ddp-static-graph --max-grad-norm 1.0 --log-every-n-steps 100 --metrics-every 500 --accum-steps 1"
 
-
 # ============================================================================
 # TASK 1: PRECISION SWEEP
 #
@@ -282,196 +282,12 @@ COMMON="--epochs 1 --max-steps 50 --fresh_start --ddp-static-graph --max-grad-no
 #       meaningful on Blackwell (B300). The B300 script includes FP8.
 # ============================================================================
 
-sep "TASK 1: PRECISION SWEEP (4x H100, batch_size=8)"
-
-# BF16 — the recommended precision for H100.
-# Uses torch.amp autocast with bfloat16. No loss scaling needed.
+# single run
+sep "TASK 1: PRECISION SWEEP (4x H100, batch_size=12)"
 run_training "Precision: BF16" \
     $MAX_GPUS \
-    "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress $COMMON" \
-    29500
-
-# FP16 — uses torch.amp autocast with float16.
-# Requires GradScaler for loss scaling to avoid underflow.
-run_training "Precision: FP16" \
-    $MAX_GPUS \
-    "--amp-dtype fp16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress $COMMON" \
-    29501
-
-# FP32 with TF32 — full 32-bit accumulation, but matmuls use TF32 hardware paths.
-# TF32 gives ~2x speedup over pure FP32 on H100 Tensor Cores with minimal accuracy loss.
-run_training "Precision: FP32 with TF32" \
-    $MAX_GPUS \
-    "--amp-dtype fp32 --ddp-bucket-cap-mb 256 $COMMON" \
-    29502
-
-# FP32 pure (no TF32) — the slowest reference baseline.
-# --no-tf32 disables TF32 in matmul and cuDNN, sets float32_matmul_precision='highest'.
-# Useful to quantify how much TF32 helps on H100.
-run_training "Precision: FP32 pure (no TF32)" \
-    $MAX_GPUS \
-    "--amp-dtype fp32 --no-tf32 --ddp-bucket-cap-mb 256 $COMMON" \
-    29503
-
-
-# ============================================================================
-# TASK 2: BATCH SIZE SWEEP
-#
-# Measures: Seconds per iteration at different global batch sizes
-# Config:   4x H100, BF16 precision
-# Batch sizes: 4, 8, 12 (per-GPU: 1, 2, 3)
-#
-# NOTE: With num_ensemble_members=4, this model uses ~90 GB per GPU at
-#       per-GPU batch=2. Larger per-GPU batches (4+) OOM on H100 93 GB.
-#       So we test: global 4 (per-GPU=1), 8 (per-GPU=2), 12 (per-GPU=3).
-# ============================================================================
-
-sep "TASK 2: BATCH SIZE SWEEP (4x H100, BF16)"
-
-# global_batch=4 — per-GPU=1. Minimal batch, tests kernel launch overhead.
-run_training "BatchSize: 4" \
-    $MAX_GPUS \
-    "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 4 $COMMON" \
-    29510
-
-# global_batch=8 — per-GPU=2. This is the YAML default.
-run_training "BatchSize: 8" \
-    $MAX_GPUS \
-    "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 8 $COMMON" \
-    29511
-
-# global_batch=12 — per-GPU=3. Tests memory headroom near the OOM boundary.
-run_training "BatchSize: 12" \
-    $MAX_GPUS \
     "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 12 $COMMON" \
-    29512
-
-
-# ============================================================================
-# TASK 3: DATA LOCATION — Local NVMe vs GPFS
-#
-# Measures: Seconds per iteration from different storage backends
-# Config:   4x H100, batch_size=8, BF16
-#
-# Purpose: Isolate I/O bottleneck. If local NVMe is significantly faster
-#          than GPFS, the training is I/O-bound and would benefit from
-#          staging data to local scratch before training.
-#
-# NOTE: Set DATA_DIR_GPFS and DATA_DIR_LOCAL at the top of this script
-#       to enable this section. Both must be non-empty.
-# ============================================================================
-
-if [ -n "$DATA_DIR_LOCAL" ] && [ -n "$DATA_DIR_GPFS" ]; then
-    sep "TASK 3: DATA LOCATION — Local NVMe vs GPFS (4x H100, batch_size=8)"
-
-    # GPFS — network-attached parallel filesystem (default for most HPC jobs)
-    run_training "DataLoc: GPFS" \
-        $MAX_GPUS \
-        "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --data-dir-override $DATA_DIR_GPFS $COMMON" \
-        29520
-
-    # Local NVMe — node-local SSD (fastest possible I/O, but data must be staged)
-    run_training "DataLoc: Local NVMe" \
-        $MAX_GPUS \
-        "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --data-dir-override $DATA_DIR_LOCAL $COMMON" \
-        29521
-
-else
-    sep "TASK 3: DATA LOCATION — SKIPPED"
-    echo "To enable, set DATA_DIR_GPFS and DATA_DIR_LOCAL at the top of this script."
-    echo "  e.g. DATA_DIR_GPFS=/project/pedramh/h5data/h5data"
-    echo "       DATA_DIR_LOCAL=/local/scratch/h5data"
-fi
-
-
-# ============================================================================
-# TASK 4: GPU SCALING
-#
-# Measures: Seconds per iteration with 1, 2, 4 GPUs
-# Config:   H100, BF16, per-GPU batch_size=2 (kept constant)
-#
-# Purpose: Measure how well training scales across GPUs.
-#   - 1 GPU:  global_batch=2 (per-GPU=2). Pure compute, no allreduce.
-#   - 2 GPU:  global_batch=4 (per-GPU=2). Tests NVLink scaling.
-#   - 4 GPU:  global_batch=8 (per-GPU=2). Full node scaling.
-#
-# We keep per-GPU batch_size constant at 2 to isolate the effect of
-# DDP communication overhead from batch size differences.
-# Ideal: 4 GPU should process 4x the global batch in the same wall time.
-# ============================================================================
-
-sep "TASK 4: GPU SCALING (H100, per-GPU batch=2, BF16)"
-
-# 1 GPU — no DDP communication overhead.
-# global_batch=2 so per-GPU=2 (fits in 93 GB).
-run_training "GPUScale: 1 GPU" \
-    1 \
-    "--amp-dtype bf16 --batch-size-override 2 $COMMON" \
-    29530
-
-# 2 GPUs — tests NVLink scaling.
-# global_batch=4 so per-GPU=2.
-if [ "$MAX_GPUS" -ge 2 ]; then
-    run_training "GPUScale: 2 GPU" \
-        2 \
-        "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 4 $COMMON" \
-        29531
-fi
-
-# 4 GPUs — full node.
-# global_batch=8 so per-GPU=2.
-if [ "$MAX_GPUS" -ge 4 ]; then
-    run_training "GPUScale: 4 GPU" \
-        4 \
-        "--amp-dtype bf16 --ddp-bucket-cap-mb 256 --ddp-fp16-compress --batch-size-override 8 $COMMON" \
-        29532
-fi
-
-
-# ============================================================================
-# OPTIONAL: NSYS PROFILING (uncomment to enable)
-#
-# Nsight Systems captures GPU kernel timelines, CUDA API calls, NCCL comms,
-# and memory transfers. Output is a .nsys-rep file viewable in nsys-ui.
-# ============================================================================
-
-# Uncomment the block below to enable nsys profiling on H100:
-#
-if command -v nsys &>/dev/null; then
-    sep "OPTIONAL: NSYS PROFILING (1 GPU, BF16)"
-    PROF_COMMON="--ddp-static-graph --max-grad-norm 1.0 --log-every-n-steps 10 --metrics-every 50 --accum-steps 1"
-    nsys profile \
-        --trace=cuda,nvtx,osrt,cudnn,cublas \
-        --cuda-memory-usage=true \
-        --gpu-metrics-device=all \
-        --output="nsys_h100_bf16_1gpu" \
-        --force-overwrite=true \
-        torchrun --standalone --nproc_per_node=1 --master_port=29550 \
-            $TRAIN_SCRIPT --yaml_config=$YAML_CONFIG --run_num=$RUN_NUM \
-            --amp-dtype bf16 \
-            --compile-max-autotune $PROF_COMMON
-fi
-
-
-# ============================================================================
-# OPTIONAL: PYTORCH PROFILER (uncomment to enable)
-#
-# The built-in PyTorch profiler generates Chrome/TensorBoard traces with
-# per-operator FLOPs and memory allocation tracking.
-# Output: <experiment_dir>/profiler_traces/*.json
-# ============================================================================
-
-# Uncomment the block below to enable PyTorch Profiler on H100:
-#
-# sep "OPTIONAL: PYTORCH PROFILER (1 GPU, BF16)"
-# run_training "PyTorch Profiler: BF16 1GPU" \
-#     1 \
-#     "--amp-dtype bf16 \
-#      --profiling --profile-wait-steps 5 --profile-warmup-steps 3 \
-#      --profile-active-steps 10 --profile-with-flops --profile-memory \
-#      --ddp-static-graph --max-grad-norm 1.0 --log-every-n-steps 10 \
-#      --metrics-every 50 --accum-steps 1" \
-#     29560
+    29500
 
 
 # ============================================================================
