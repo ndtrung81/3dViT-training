@@ -159,6 +159,7 @@ dependencies:
   - xorg-libxrender=0.9.12=hb9d3cd8_0
   - xorg-libxtst=1.2.5=hb9d3cd8_3
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu130
       - ai-models==0.7.4
       - ai-models-fourcastnet==0.0.7
       - ai-models-fourcastnetv2==0.0.3
