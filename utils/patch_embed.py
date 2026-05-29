@@ -133,7 +133,7 @@ class PatchEmbed3D_Cyclic(nn.Module):
         if l_remainder:
             l_pad = l_patch_size - l_remainder
             padding_back = l_pad // 2
-            padding_front = l_pad - padding_front
+            padding_front = l_pad - padding_back
         if h_remainder:
             h_pad = h_patch_size - h_remainder
             padding_top = h_pad // 2
@@ -194,7 +194,7 @@ class PatchEmbed3D(nn.Module):
         if l_remainder:
             l_pad = l_patch_size - l_remainder
             padding_back = l_pad // 2
-            padding_front = l_pad - padding_front
+            padding_front = l_pad - padding_back
         if h_remainder:
             h_pad = h_patch_size - h_remainder
             padding_top = h_pad // 2
@@ -205,11 +205,6 @@ class PatchEmbed3D(nn.Module):
             padding_right = w_pad - padding_left
 
         self.padded_front = padding_front > padding_back
-
-        print('Pad sizes in 3D patch embedding')
-        print((padding_left, padding_right, padding_top, padding_bottom, padding_front, padding_back))
-        print('Patch Size')
-        print(patch_size)
 
         self.pad = nn.ZeroPad3d(
             (padding_left, padding_right, padding_top, padding_bottom, padding_front, padding_back)

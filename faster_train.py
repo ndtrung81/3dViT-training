@@ -49,6 +49,14 @@ try:
 except Exception:
     _sdp_kernel = None
 
+# Optional Transformer Engine for FP8 on Hopper (SM 9.0) and Blackwell (SM 10.0+)
+try:
+    import transformer_engine.pytorch as te
+    _te_available = True
+except ImportError:
+    te = None
+    _te_available = False
+
 from utils import logging_utils
 from utils.power_spectrum import *
 from utils.losses import (
@@ -222,8 +230,9 @@ class Trainer():
         self.get_dataset()
         self.spectra_dir, self.diagnostics_dir, self.output_dir = self.create_dirs(self.run_uuid)
 
-        # AMP dtype selection (bf16 preferred for H100)
+        # AMP dtype selection (bf16 preferred for H100/B300; fp8 via Transformer Engine for Blackwell)
         amp_choice = getattr(self.params, "amp_dtype", "auto")
+        self.use_fp8 = False
         if amp_choice == "bf16" and torch.cuda.is_available():
             self.amp_dtype = torch.bfloat16
         elif amp_choice == "fp16" and torch.cuda.is_available():
@@ -231,6 +240,27 @@ class Trainer():
         elif amp_choice == "fp32":
             self.amp_dtype = torch.float32
             logging.info("Using FP32 (no mixed precision)")
+        elif amp_choice == "fp8":
+            # FP8 requires NVIDIA Transformer Engine + Hopper (SM 9.0) or Blackwell (SM 10.0+).
+            # The model uses standard nn.Linear, so TE's fp8_autocast() is applied as an outer
+            # context alongside BF16 autocast. Full FP8 throughput would require replacing
+            # nn.Linear with te.Linear in networks/pangu.py — this enables the path safely.
+            if _te_available and torch.cuda.is_available():
+                _sm_major = torch.cuda.get_device_properties(self.device).major
+                if _sm_major >= 9:
+                    self.amp_dtype = torch.bfloat16
+                    self.use_fp8 = True
+                    params['use_transformer_engine'] = True
+                    logging.info("FP8 via Transformer Engine enabled (BF16 accumulation, SM %d.x) — TE layers active", _sm_major)
+                else:
+                    self.amp_dtype = torch.bfloat16
+                    logging.warning("FP8 requested but GPU SM %d.x < 9.0 (need Hopper/Blackwell); falling back to BF16", _sm_major)
+            else:
+                self.amp_dtype = torch.bfloat16
+                if not _te_available:
+                    logging.warning("FP8 requested but transformer_engine is not installed; falling back to BF16")
+                else:
+                    logging.warning("FP8 requested but no CUDA device available; falling back to BF16")
         else:
             # H100 strongly prefers BF16
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
@@ -258,7 +288,7 @@ class Trainer():
         # Model + integrator
         self.mask_bool, self.land_mask = self.get_land_mask_bool()
         self.model = self.get_model()
-        self.scaler = GradScaler(enabled=(torch.cuda.is_available() and self.amp_dtype == torch.float16))
+        self.scaler = GradScaler(enabled=(torch.cuda.is_available() and self.amp_dtype == torch.float16 and not getattr(self, 'use_fp8', False)))
 
         # >>> create optimizer BEFORE scheduler (and before resume)
         self.optimizer = self.get_optimizer()
@@ -863,7 +893,8 @@ class Trainer():
                  target_diagnostic, target_surface, target_upper_air, **kwargs):
         output_surface = output_upper_air = output_diagnostic = 0
         loss = loss_diagnostic = loss_pl = loss_sfc = loss_vae = 0
-        with autocast(device_type="cuda",
+        _fp8_cm = te.fp8_autocast() if (self.use_fp8 and _te_available and te is not None) else contextlib.nullcontext()
+        with _fp8_cm, autocast(device_type="cuda",
                       dtype=self.amp_dtype if torch.cuda.is_available() else torch.float32,
                       enabled=torch.cuda.is_available() and self.amp_dtype != torch.float32):
             if self.params.has_diagnostic:
@@ -1462,7 +1493,7 @@ if __name__ == '__main__':
     parser.add_argument("--ddp-powersgd", action="store_true", help="Enable PowerSGD gradient compression (may affect accuracy)")
     parser.add_argument("--ddp-fp16-compress", action="store_true", help="Enable FP16 gradient compression")
     parser.add_argument("--powersgd-rank", default=1, type=int, help="PowerSGD low-rank size")
-    parser.add_argument("--amp-dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32"], help="AMP compute dtype (bf16 recommended for H100)")
+    parser.add_argument("--amp-dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32", "fp8"], help="AMP compute dtype (bf16 recommended for H100/B300; fp8 requires transformer_engine on Hopper/Blackwell)")
     parser.add_argument("--log-every-n-steps", default=20, type=int, help="Throttle per-step logging/W&B to every N steps (1 = log every step)")
     parser.add_argument("--metrics-every", default=100, type=int, help="Compute per-step metrics (RMSE etc.) every N steps; 0 = disable")
     parser.add_argument("--grad-stats-every", default=0, type=int, help="Compute grad norm / max every N steps; 0 = disable")

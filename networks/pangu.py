@@ -473,7 +473,7 @@ class PanguModel_Plasim(nn.Module):
             ##############Data Preparation for Encoder 2############################
             if self.upper_air_boundary:
                 surface_target = torch.cat([target_surface, constant_boundary, surface_varying_boundary], dim=1)
-                surface_target = self.patchembed2d(surface)
+                surface_target = self.patchembed2d(surface_target)
                 target_upper_air = self.patchembed3d(target_upper_air)
                 x_target = torch.cat([upper_air_varying_boundary.unsqueeze(2), target_upper_air, surface_target.unsqueeze(2)], dim=2)
 
@@ -546,7 +546,7 @@ class PanguModel_Plasim(nn.Module):
                     self.land_mask(output_surface[:, self.num_surface_vars: self.num_surface_vars + self.num_land_vars]).to(output_surface.dtype)
             if self.has_ocean and self.mask_output:
                 output_surface[:, self.num_surface_vars + self.num_land_vars:] = \
-                    self.land_mask(output_surface[:, self.num_surface_vars + self.num_land_vars:]).to(output_surface.dtype)
+                    self.ocean_mask(output_surface[:, self.num_surface_vars + self.num_land_vars:]).to(output_surface.dtype)
             if self.checkpointing > 0 and train:
                 output_upper_air = checkpoint(self.patchrecovery3d, output_upper_air_delta, use_reentrant=self.use_reentrant)
             else:
@@ -567,7 +567,7 @@ class PanguModel_Plasim(nn.Module):
                     self.land_mask(output_surface[:, self.num_surface_vars: self.num_surface_vars + self.num_land_vars]).to(output_surface.dtype)
             if self.has_ocean and self.mask_output:
                 output_surface[:, self.num_surface_vars + self.num_land_vars:] = \
-                    self.land_mask(output_surface[:, self.num_surface_vars + self.num_land_vars:]).to(output_surface.dtype)
+                    self.ocean_mask(output_surface[:, self.num_surface_vars + self.num_land_vars:]).to(output_surface.dtype)
             if self.checkpointing > 0 and train:
                 output_upper_air = checkpoint(self.patchrecovery3d, output_upper_air, use_reentrant=self.use_reentrant)
             else:

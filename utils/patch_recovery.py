@@ -592,6 +592,7 @@ class PolarPad2d(nn.Module):
         self.pad_top = pad[0]
         self.pad_bottom = pad[1]
         self.num_lat = num_lat if num_lat is not None else 64
+        self.grid_has_poles = grid_has_poles
         if not grid_has_poles:
             self.pad_idxs = torch.cat((torch.arange(self.pad_top), torch.arange(self.pad_top+1, self.num_lat+self.pad_top+1),
                                        torch.arange(self.num_lat+self.pad_top+2, self.num_lat+self.pad_top+self.pad_bottom+2))).long()
@@ -628,6 +629,7 @@ class PolarPad3d(nn.Module):
         self.pad_top = pad[0]
         self.pad_bottom = pad[1]
         self.num_lat = num_lat if num_lat is not None else 64
+        self.grid_has_poles = grid_has_poles
         if not grid_has_poles:
             self.pad_idxs = torch.cat((torch.arange(self.pad_top), torch.arange(self.pad_top+1, self.num_lat+self.pad_top+1),
                                        torch.arange(self.num_lat+self.pad_top+2, self.num_lat+self.pad_top+self.pad_bottom+2))).long()
