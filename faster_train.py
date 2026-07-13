@@ -201,8 +201,12 @@ def compute_weighted_acc(da_fc, da_true, clim=None, weighted=True, mean_dims=xr.
     return acc
 
 def to_ensemble_batch(data, ens_members):
-    """Convert batch of M samples (M, ...) to a batch of (M*ens_members, ...)."""
-    return (data.unsqueeze(1) * torch.ones(1, ens_members, *data.shape[1:]).to(data.device)).flatten(0, 1)
+    """Convert batch of M samples (M, ...) to a batch of (M*ens_members, ...).
+
+    Members of a sample are contiguous ([s0, s0, ..., s1, s1, ...]), matching the
+    [B, E, ...] grouping used by the CRPS loss and the model's latent-space sampling.
+    """
+    return data.repeat_interleave(ens_members, dim=0)
 
 # ------------------------------------
 # Trainer
@@ -376,9 +380,13 @@ class Trainer():
             except Exception:
                 pass
         
+        # Training keeps inputs at batch B (ensemble members are sampled at the model's
+        # latent bottleneck), so it uses the un-expanded boundary. Validation still
+        # expands its inputs to B*E and needs the expanded copy.
+        self.constant_boundary_data_ens = self.constant_boundary_data
         if params.num_ensemble_members > 1:
-            self.constant_boundary_data = to_ensemble_batch(self.constant_boundary_data, params.num_ensemble_members)
-            logging.info('Ensemble Mode. Ensemble size = {params.num_ensemble_members}\n')
+            self.constant_boundary_data_ens = to_ensemble_batch(self.constant_boundary_data, params.num_ensemble_members)
+            logging.info(f'Ensemble Mode. Ensemble size = {params.num_ensemble_members}\n')
 
         climatology_path = os.path.join(params.data_dir, self.params.climatology_file)
         self.climatology = xr.open_dataset(climatology_path).rename({'time': 'dayofyear'})
@@ -816,6 +824,10 @@ class Trainer():
                     if (i % metrics_every == 0):
                         with torch.inference_mode():
                             if self.params.predict_delta:
+                                # Outputs/targets are [B*E]; inputs stayed at [B]
+                                if self.params.num_ensemble_members > 1:
+                                    input_surface = to_ensemble_batch(input_surface, self.params.num_ensemble_members)
+                                    input_upper_air = to_ensemble_batch(input_upper_air, self.params.num_ensemble_members)
                                 output_surface, output_upper_air = self.integrator(input_surface, input_upper_air, output_surface, output_upper_air)
                                 target_surface_int, target_upper_air_int = self.integrator(input_surface, input_upper_air, target_surface, target_upper_air)
                             else:
@@ -878,14 +890,13 @@ class Trainer():
                 lambda x: x.to(self.device, dtype=torch.float32, non_blocking=True), data)
 
         if self.params.num_ensemble_members > 1:
+            # Only targets are expanded to [B*E] (the CRPS loss consumes one copy per
+            # member). Inputs stay at [B]: the model runs its encoders once per sample
+            # and samples E ensemble members at the latent bottleneck.
+            target_surface = to_ensemble_batch(target_surface, params.num_ensemble_members)
+            target_upper_air = to_ensemble_batch(target_upper_air, params.num_ensemble_members)
             if self.params.has_diagnostic:
-                ensemble_batches = [to_ensemble_batch(temp_batch, params.num_ensemble_members) for temp_batch in
-                                    [input_surface, input_upper_air, target_surface, target_upper_air, target_diagnostic, varying_boundary_data]]
-                input_surface, input_upper_air, target_surface, target_upper_air, target_diagnostic, varying_boundary_data = ensemble_batches
-            else:
-                ensemble_batches = [to_ensemble_batch(temp_batch, params.num_ensemble_members) for temp_batch in
-                                    [input_surface, input_upper_air, target_surface, target_upper_air, varying_boundary_data]]
-                input_surface, input_upper_air, target_surface, target_upper_air, varying_boundary_data = ensemble_batches
+                target_diagnostic = to_ensemble_batch(target_diagnostic, params.num_ensemble_members)
 
         return input_surface, input_upper_air, target_surface, target_upper_air, target_diagnostic, varying_boundary_data
 
@@ -893,6 +904,12 @@ class Trainer():
                  target_diagnostic, target_surface, target_upper_air, **kwargs):
         output_surface = output_upper_air = output_diagnostic = 0
         loss = loss_diagnostic = loss_pl = loss_sfc = loss_vae = 0
+        _E = int(self.params.num_ensemble_members)
+        # Targets arrive expanded to [B*E] for the loss; the model only needs one copy
+        # per sample ([::E] keeps sample order) so encoder 2 runs at batch B. The model
+        # samples E ensemble members at the latent bottleneck and returns [B*E] outputs.
+        _target_surface_in = target_surface[::_E] if _E > 1 else target_surface
+        _target_upper_air_in = target_upper_air[::_E] if _E > 1 else target_upper_air
         _fp8_cm = te.fp8_autocast() if (self.use_fp8 and _te_available and te is not None) else contextlib.nullcontext()
         with _fp8_cm, autocast(device_type="cuda",
                       dtype=self.amp_dtype if torch.cuda.is_available() else torch.float32,
@@ -900,12 +917,12 @@ class Trainer():
             if self.params.has_diagnostic:
                 output_surface, output_upper_air, output_diagnostic, mu, sigma, mu2, sigma2 = self.model(
                     input_surface, self.constant_boundary_data, varying_boundary_data, input_upper_air,
-                    target_surface, target_upper_air, train=True)
+                    _target_surface_in, _target_upper_air_in, train=True, num_ensemble_members=_E)
                 loss_diagnostic = self.loss_obj_diagnostic(output_diagnostic, target_diagnostic)
             else:
                 output_surface, output_upper_air, mu, sigma, mu2, sigma2 = self.model(
                     input_surface, self.constant_boundary_data, varying_boundary_data, input_upper_air,
-                    target_surface, target_upper_air, train=True)
+                    _target_surface_in, _target_upper_air_in, train=True, num_ensemble_members=_E)
 
             loss_sfc = self.loss_obj_sfc(output_surface, target_surface)
             loss_pl = self.loss_obj_pl(output_upper_air, target_upper_air)
@@ -1113,10 +1130,10 @@ class Trainer():
                 for step in range(max_lead_time):
                     if self.params.has_diagnostic:
                         val_output_surface, val_output_upper_air, val_output_diagnostic, _, _  = self.model(
-                            val_input_surface, self.constant_boundary_data, val_varying_boundary_data[:, step], val_input_upper_air)
+                            val_input_surface, self.constant_boundary_data_ens, val_varying_boundary_data[:, step], val_input_upper_air)
                     else:
                         val_output_surface, val_output_upper_air,  _, _ = self.model(
-                            val_input_surface, self.constant_boundary_data, val_varying_boundary_data[:, step], val_input_upper_air)
+                            val_input_surface, self.constant_boundary_data_ens, val_varying_boundary_data[:, step], val_input_upper_air)
 
                     if (step + 1) in lead_times_steps:
                         target_index = step

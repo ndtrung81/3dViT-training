@@ -430,17 +430,26 @@ class PanguModel_Plasim(nn.Module):
 
     def reparameterize(self, mu, sigma):
             std = torch.exp(0.5 * sigma)
-            eps = torch.randn_like(std)
+            # torch.randn rather than randn_like: randn_like fills values in the
+            # input's memory order, so the noise realization would depend on
+            # sigma's strides (conv output is permuted, repeat_interleave output
+            # is contiguous). A plain contiguous draw is layout-independent.
+            eps = torch.randn(std.size(), dtype=std.dtype, device=std.device)
             return mu + eps * std
     
-    def forward(self, surface_in, constant_boundary, varying_boundary, upper_air_in, 
-                     target_surface=None, target_upper_air=None, train = False):
+    def forward(self, surface_in, constant_boundary, varying_boundary, upper_air_in,
+                     target_surface=None, target_upper_air=None, train = False, num_ensemble_members = 1):
         """
         Args:
             surface (torch.Tensor): 2D n_lat=721, n_lon=1440, chans=4.
             surface_mask (torch.Tensor): 2D n_lat=721, n_lon=1440, chans=3.
             upper_air (torch.Tensor): 3D n_pl=13, n_lat=721, n_lon=1440, chans=5.
             train (bool): If True, the model will be trained, otherwise it will be evaluated.
+            num_ensemble_members (int): If > 1, the encoders run once per sample (batch B)
+                and E ensemble members are sampled at the latent bottleneck; the decoder
+                then runs at batch B*E. Members of a sample are contiguous in the output
+                ([s0m0, s0m1, ..., s1m0, ...]), matching the [B, E, ...] grouping used by
+                the CRPS loss.
         """
         
         
@@ -501,9 +510,15 @@ class PanguModel_Plasim(nn.Module):
         # reshape(B, self.downscale_resolution[0],self.downscale_resolution[1],self.downscale_resolution[2],-1).permute(0, 4, 1, 2, 3) # should be #8, 10,23,45, 384
         # print("x_vae reshaped after ", x_vae.shape) 
         ###########VAE Enocer 1#################
-        mu = self.layer_mu(x_vae) # should be #8,192, 10,23,45, 
-        sigma = self.layer_sigma(x_vae) # should be #8, 192, 10,23,45, 
-        norm = self.reparameterize(mu, sigma) # should be #8,192, 10,23,45
+        mu = self.layer_mu(x_vae) # should be #8,192, 10,23,45,
+        sigma = self.layer_sigma(x_vae) # should be #8, 192, 10,23,45,
+        if num_ensemble_members > 1:
+            # Encoder diversity comes only from the noise below, so sample E members
+            # per input here instead of running the encoders on E identical copies.
+            norm = self.reparameterize(mu.repeat_interleave(num_ensemble_members, dim=0),
+                                       sigma.repeat_interleave(num_ensemble_members, dim=0))
+        else:
+            norm = self.reparameterize(mu, sigma) # should be #8,192, 10,23,45
         x_purb = self.layer_purturbation(norm)
         #print("mu, sigma, norm, x_purb", mu.shape, sigma.shape, norm.shape, x_purb.shape) #8, 10, 23, 45, 192
 
@@ -514,12 +529,15 @@ class PanguModel_Plasim(nn.Module):
             x_e2 = checkpoint(self.layer3_e3, x_e2, use_reentrant=self.use_reentrant)
             x_e2_vae = x_e2.reshape(B, self.downscale_resolution[0], self.downscale_resolution[1], self.downscale_resolution[2], -1).permute(0, 4, 1, 2, 3) 
 
-            mu_e2 = self.layer_mu_e2(x_e2_vae) 
+            mu_e2 = self.layer_mu_e2(x_e2_vae)
             sigma_e2 = self.layer_sigma_e2(x_e2_vae)
-            norm_e2 = self.reparameterize(mu_e2, sigma_e2) 
 
 
         ##############Decoder ##################
+        if num_ensemble_members > 1:
+            x = x.repeat_interleave(num_ensemble_members, dim=0)
+            skip = skip.repeat_interleave(num_ensemble_members, dim=0)
+            B = B * num_ensemble_members
         x  = x_purb  +  x
         #x = self.layer_perturbation2(x) #8, 384, 10, 23, 45
         x = x.permute(0, 2, 3,4, 1).reshape(B, -1, self.embed_dim * self.updown_scale_factor) #8, 10350, 384
@@ -836,10 +854,10 @@ class EarthSpecificLayer(nn.Module): #BasicLayer(nn.Module):
 
     def forward(self, x):
         for blk in self.blocks:
-            # if self.checkpointing > 2 and train:
-            #     x = checkpoint(blk, x, use_reentrant=self.use_reentrant)
-            # else:
-            x = blk(x)
+            if self.checkpointing > 2 and self.training:
+                x = checkpoint(blk, x, use_reentrant=self.use_reentrant)
+            else:
+                x = blk(x)
         return x
 
 
