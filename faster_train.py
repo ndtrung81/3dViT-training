@@ -37,7 +37,10 @@ from ruamel.yaml.comments import CommentedMap as ruamelDict
 from ruamel.yaml import YAML
 from collections import OrderedDict
 import matplotlib.pyplot as plt
-#import wandb
+try:
+    import wandb  # only exercised when params.log_to_wandb is set
+except ImportError:
+    wandb = None
 from itertools import product
 import time
 from multiprocessing import Process
@@ -158,22 +161,18 @@ def weighted_rmse_torch_3D(pred, target, latitudes=None, weight=None):
     result = torch.sqrt(torch.mean(weight * (pred - target)**2., dim=(-1, -2)))
     return result
 
-def grad_norm(model):
-    total_norm = 0.0
-    parameters = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
-    for p in parameters:
-        param_norm = p.grad.detach().data.norm(2)
-        total_norm += param_norm.item() ** 2
-    return total_norm ** 0.5
+def grad_norm_and_max(model):
+    """Grad L2-norm and abs-max in one pass, returned as device tensors.
 
-def grad_max(model):
-    max_grad = 0.0
-    parameters = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
-    for p in parameters:
-        param_max = torch.max(torch.abs(p.grad.detach().data))
-        if max_grad < param_max.item():
-            max_grad = param_max.item()
-    return param_max
+    No per-parameter .item(): each one forces a host-device sync (hundreds per
+    call on this model); the only sync is deferred to logging time.
+    """
+    params = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
+    if not params:
+        return torch.tensor(0.0), torch.tensor(0.0)
+    norms = torch.stack([p.grad.detach().norm(2) for p in params])
+    maxes = torch.stack([p.grad.detach().abs().max() for p in params])
+    return norms.norm(2), maxes.max()
 
 def evaluate_iterative_forecast(da_fc, da_true, func, clim, mean_dims=['lat', 'lon', 'time'], weighted=True):
     scores = []
@@ -232,8 +231,11 @@ def to_ensemble_batch(data, ens_members):
 
     Members of a sample are contiguous ([s0, s0, ..., s1, s1, ...]), matching the
     [B, E, ...] grouping used by the CRPS loss and the model's latent-space sampling.
+    expand() is a zero-copy view and the reshape materializes it with a plain
+    copy kernel — faster than repeat_interleave, which builds an index tensor
+    and gathers.
     """
-    return data.repeat_interleave(ens_members, dim=0)
+    return data.unsqueeze(1).expand(-1, ens_members, *data.shape[1:]).reshape(-1, *data.shape[1:])
 
 # ------------------------------------
 # Trainer
@@ -424,8 +426,34 @@ class Trainer():
             self.lat_weight_2d = _lat_w.view(1, 1, -1, 1)          # [1,1,H,1]
             self.lat_weight_3d = _lat_w.view(1, 1, 1, -1, 1)       # [1,1,1,H,1]
 
+        # Device-resident copies of the de-normalization stats. The dataset's
+        # inv_transforms keep mean/std on CPU (they are also used inside the
+        # loader workers), which forced validation to copy every rollout step
+        # to host before de-normalizing. With these, inv-transforms run on GPU
+        # and one D2H copy happens per batch instead of one per step.
+        vd = self.valid_dataset
+        self._sfc_std_d = vd.surface_std.to(self.device).reshape(1, -1, 1, 1)
+        self._sfc_mean_d = vd.surface_mean.to(self.device).reshape(1, -1, 1, 1)
+        self._ua_std_d = vd.upper_air_std.to(self.device).reshape(1, len(vd.upper_air_variables), -1, 1, 1)
+        self._ua_mean_d = vd.upper_air_mean.to(self.device).reshape(1, len(vd.upper_air_variables), -1, 1, 1)
+        if self.params.has_diagnostic:
+            self._diag_std_d = vd.diagnostic_std.to(self.device).reshape(1, -1, 1, 1)
+            self._diag_mean_d = vd.diagnostic_mean.to(self.device).reshape(1, -1, 1, 1)
+
         if world_rank == 0:
             logging.info('rank %d, data loader initialized', self.world_rank)
+
+    # GPU versions of the dataset inv_transforms (same math, device-resident
+    # stats). Broadcasting aligns trailing dims, so they accept both single
+    # states [B, C, ...] and stacked trajectories [B, T, C, ...].
+    def surface_inv_gpu(self, x):
+        return x * self._sfc_std_d + self._sfc_mean_d
+
+    def upper_air_inv_gpu(self, x):
+        return x * self._ua_std_d + self._ua_mean_d
+
+    def diagnostic_inv_gpu(self, x):
+        return x * self._diag_std_d + self._diag_mean_d
 
     def init_wandb(self, params:dict):
         if params.log_to_wandb:
@@ -932,6 +960,21 @@ class Trainer():
             if self.params.has_diagnostic:
                 target_diagnostic = to_ensemble_batch(target_diagnostic, params.num_ensemble_members)
 
+        # Optional channels-last layout (params.use_channels_last): keeps the
+        # patch-embedding convs in NHWC and avoids cuDNN's nchw<->nhwc
+        # conversion kernels. 4D tensors -> channels_last, 5D -> channels_last_3d.
+        if getattr(self.params, 'use_channels_last', False) and torch.cuda.is_available():
+            cl, cl3 = torch.channels_last, torch.channels_last_3d
+            input_surface = input_surface.to(memory_format=cl)
+            input_upper_air = input_upper_air.to(memory_format=cl3)
+            target_surface = target_surface.to(memory_format=cl)
+            target_upper_air = target_upper_air.to(memory_format=cl3)
+            if isinstance(target_diagnostic, torch.Tensor):
+                target_diagnostic = target_diagnostic.to(memory_format=cl)
+            if isinstance(varying_boundary_data, torch.Tensor):
+                varying_boundary_data = varying_boundary_data.to(
+                    memory_format=cl if varying_boundary_data.dim() == 4 else cl3)
+
         return input_surface, input_upper_air, target_surface, target_upper_air, target_diagnostic, varying_boundary_data
 
     def cal_loss(self, input_surface, constant_boundary_data, varying_boundary_data, input_upper_air,
@@ -981,8 +1024,9 @@ class Trainer():
         # Optional grad stats (expensive)
         g_every = int(getattr(self.params, 'grad_stats_every', 0) or 0)
         if g_every > 0 and step is not None and (step % g_every == 0):
-            diagnostic_logs['batch_grad_norm'] = torch.tensor([grad_norm(self.model)], device=self.device, dtype=torch.float32)
-            diagnostic_logs['batch_grad_max']  = torch.tensor([grad_max(self.model)], device=self.device, dtype=torch.float32)
+            _gnorm, _gmax = grad_norm_and_max(self.model)
+            diagnostic_logs['batch_grad_norm'] = _gnorm.to(self.device, dtype=torch.float32)
+            diagnostic_logs['batch_grad_max'] = _gmax.to(self.device, dtype=torch.float32)
 
         # Always carry forward the tensors we need to all_reduce
         for key, value in kwargs.items():
@@ -1002,24 +1046,27 @@ class Trainer():
                 for k, level in enumerate(current_dataset.levels):
                     diagnostic_logs[f'train_{var}_level{level:.4f}_lwrmse'] = torch.mean(upper_air_lwrmse[:, j, k]) * current_dataset.upper_air_std[j, k]
 
-        if dist.is_initialized():
-            for key in sorted(list(diagnostic_logs.keys())):
-                if key == 'batch_grad_max':
-                    grad_max_tensor = torch.zeros(dist.get_world_size(), dtype=torch.float32, device=self.device)
-                    dist.all_gather_into_tensor(grad_max_tensor, diagnostic_logs[key])
-                    diagnostic_logs[key] = torch.max(grad_max_tensor)
-                else:
-                    val = diagnostic_logs[key]
-                    if not isinstance(val, torch.Tensor):
-                        val = torch.tensor(val, device=self.device, dtype=torch.float32)
-                    dist.all_reduce(val)
-                    diagnostic_logs[key] = float(val / dist.get_world_size())
-        else:
-            # Convert to float for single-GPU case
-            for key in list(diagnostic_logs.keys()):
-                val = diagnostic_logs[key]
-                if isinstance(val, torch.Tensor):
-                    diagnostic_logs[key] = float(val.item())
+        # Communication/sync happens once per call, not once per key: all fresh
+        # tensor metrics are packed into one tensor for a single all_reduce and
+        # a single D2H copy (previously ~100 keys each paid an all_reduce plus
+        # a float() sync). Keys already reduced to float on an earlier call
+        # (e.g. stale grad stats between grad_stats_every hits) are left alone
+        # instead of being re-reduced.
+        keys = sorted(diagnostic_logs.keys())
+        avg_keys = [k for k in keys if k != 'batch_grad_max' and isinstance(diagnostic_logs[k], torch.Tensor)]
+        if avg_keys:
+            packed = torch.stack([diagnostic_logs[k].detach().to(self.device, dtype=torch.float32).reshape(-1)[0]
+                                  for k in avg_keys])
+            if dist.is_initialized():
+                dist.all_reduce(packed)
+                packed = packed / dist.get_world_size()
+            for k, v in zip(avg_keys, packed.tolist()):
+                diagnostic_logs[k] = v
+        if isinstance(diagnostic_logs.get('batch_grad_max'), torch.Tensor):
+            gmax = diagnostic_logs['batch_grad_max'].detach().reshape(-1)[0].clone()
+            if dist.is_initialized():
+                dist.all_reduce(gmax, op=dist.ReduceOp.MAX)
+            diagnostic_logs['batch_grad_max'] = float(gmax)
         return diagnostic_logs
 
     def diagnostic_log_per_epoch(self, diagnostic_logs, train_loss, epoch, **kwargs)->dict:
@@ -1149,34 +1196,26 @@ class Trainer():
                         val_input_surface, val_input_upper_air, val_target_surface, val_target_upper_air, \
                         val_varying_boundary_data = ensemble_batches
 
-                # start times per sample
-                start_times = []
-                for i2 in range(times.shape[0]):
-                    start_time = self.valid_dataset.datetime_class(times[i2,0].item(), times[i2,1].item(), times[i2,2].item(), hour=times[i2,3].item())
-                    start_times.append(start_time)
+                # Start times per sample: one D2H copy for the whole tensor
+                # instead of 4 x batch_size .item() syncs.
+                times_cpu = times.cpu().numpy().astype(int)
+                start_times = [
+                    self.valid_dataset.datetime_class(times_cpu[i2, 0], times_cpu[i2, 1], times_cpu[i2, 2], hour=times_cpu[i2, 3])
+                    for i2 in range(times_cpu.shape[0])
+                ]
 
                 max_lead_time = max(lead_times_steps)
 
-                # ACC tensors (all time steps)
-                val_output_surface_acc = np.zeros((val_input_surface.shape[0], max_lead_time,
-                                                   val_input_surface.shape[1], val_input_surface.shape[2], val_input_surface.shape[3]), dtype=np.float32)
-                val_output_upper_air_acc = np.zeros((val_input_upper_air.shape[0], max_lead_time,
-                                                     val_input_upper_air.shape[1], val_input_upper_air.shape[2],
-                                                     val_input_upper_air.shape[3], val_input_upper_air.shape[4]), dtype=np.float32)
-                if self.params.has_diagnostic:
-                    val_output_diagnostic_acc = np.zeros((val_target_diagnostic.shape[0], max_lead_time,
-                                                          val_target_diagnostic.shape[2], val_target_diagnostic.shape[3],
-                                                          val_target_diagnostic.shape[4]), dtype=np.float32)
-                    val_output_diagnostic_t = np.zeros((val_target_diagnostic.shape[0], len(lead_times_steps),
-                                                        val_target_diagnostic.shape[2], val_target_diagnostic.shape[3],
-                                                        val_target_diagnostic.shape[4]), dtype=np.float32)
-
-                # tensors for selected lead times
-                val_output_surface_t = np.zeros((val_input_surface.shape[0], len(lead_times_steps),
-                                                 val_input_surface.shape[1], val_input_surface.shape[2], val_input_surface.shape[3]), dtype=np.float32)
-                val_output_upper_air_t = np.zeros((val_input_upper_air.shape[0], len(lead_times_steps),
-                                                   val_input_upper_air.shape[1], val_input_upper_air.shape[2],
-                                                   val_input_upper_air.shape[3], val_input_upper_air.shape[4]), dtype=np.float32)
+                # Trajectory buffers are GPU lists, allocated only when the
+                # corresponding diagnostic is enabled. De-normalization and the
+                # D2H copy happen once per batch on the stacked trajectory
+                # instead of once per rollout step.
+                _need_traj = self.params.diagnostic_acc or self.params.diagnostic_gif  # full trajectory (ACC/GIF)
+                _need_spectra = self.params.diagnostic_spectra                         # selected lead times only
+                if _need_traj:
+                    _surf_steps_gpu, _ua_steps_gpu, _diag_steps_gpu = [], [], []
+                if _need_spectra:
+                    _surf_t_gpu, _ua_t_gpu, _diag_t_gpu = [], [], []
 
                 step_idx = 0
                 # Rollout: one forward = one timedelta_hours step. Constant
@@ -1217,10 +1256,11 @@ class Trainer():
                         # state before scoring RMSE and feeding it back as input.
                         val_output_surface, val_output_upper_air = self.integrator(val_input_surface, val_input_upper_air, val_output_surface, val_output_upper_air)
 
-                    val_output_surface_acc[:, step] = self.valid_dataset.surface_inv_transform(val_output_surface.cpu()).numpy()
-                    val_output_upper_air_acc[:, step] = self.valid_dataset.upper_air_inv_transform(val_output_upper_air.cpu()).numpy()
-                    if self.params.has_diagnostic:
-                        val_output_diagnostic_acc[:, step] = self.valid_dataset.diagnostic_inv_transform(val_output_diagnostic.cpu()).numpy()
+                    if _need_traj:
+                        _surf_steps_gpu.append(val_output_surface)
+                        _ua_steps_gpu.append(val_output_upper_air)
+                        if self.params.has_diagnostic:
+                            _diag_steps_gpu.append(val_output_diagnostic)
 
                     if (step + 1) in lead_times_steps:
                         # Use pre-computed weights
@@ -1230,7 +1270,8 @@ class Trainer():
                             rmse_diag = weighted_rmse_torch_channels(val_output_diagnostic, val_target_diagnostic[:, target_index], weight=self.lat_weight_2d)
                             multi_step_rmse[f"valid_lwrmse_diag_{step+1}step"] += torch.mean(rmse_diag)
                             valid_diagnostic_lwrmse[step_idx] += torch.mean(rmse_diag, dim=0)
-                            val_output_diagnostic_t[:, step_idx] = self.valid_dataset.diagnostic_inv_transform(val_output_diagnostic.cpu()).numpy()
+                            if _need_spectra:
+                                _diag_t_gpu.append(val_output_diagnostic)
 
                         multi_step_rmse[f"valid_lwrmse_sfc_{step+1}step"] += torch.mean(rmse_sfc)
                         multi_step_rmse[f"valid_lwrmse_pl_{step+1}step"] += torch.mean(rmse_pl)
@@ -1238,43 +1279,52 @@ class Trainer():
                         valid_surface_lwrmse[step_idx] += torch.mean(rmse_sfc, dim=0)
                         valid_upper_air_lwrmse[step_idx] += torch.mean(rmse_pl, dim=0)
 
-                        val_output_surface_t[:, step_idx] = self.valid_dataset.surface_inv_transform(val_output_surface.cpu()).numpy()
-                        val_output_upper_air_t[:, step_idx] = self.valid_dataset.upper_air_inv_transform(val_output_upper_air.cpu()).numpy()
+                        if _need_spectra:
+                            _surf_t_gpu.append(val_output_surface)
+                            _ua_t_gpu.append(val_output_upper_air)
 
                         if step + 1 == max_lead_time:
-                            # ACC prep
-                            if self.params.diagnostic_acc or self.params.diagnostic_gif:
+                            # ACC prep: inv-transform the stacked trajectory on
+                            # GPU, then one D2H copy for the whole rollout.
+                            if _need_traj:
+                                val_output_surface_acc = self.surface_inv_gpu(torch.stack(_surf_steps_gpu, dim=1)).cpu().numpy()
+                                val_output_upper_air_acc = self.upper_air_inv_gpu(torch.stack(_ua_steps_gpu, dim=1)).cpu().numpy()
                                 if self.params.has_diagnostic:
+                                    val_output_diagnostic_acc = self.diagnostic_inv_gpu(torch.stack(_diag_steps_gpu, dim=1)).cpu().numpy()
                                     acc_datasets = self.convert_to_xarray(val_output_surface_acc, val_output_upper_air_acc, start_times, self.params, self.valid_dataset, acc=True, diagnostic_prediction=val_output_diagnostic_acc)
                                 else:
                                     acc_datasets = self.convert_to_xarray(val_output_surface_acc, val_output_upper_air_acc, start_times, self.params, self.valid_dataset, acc=True)
                                 acc_prepared = [self.prepare_preds(ds, acc=True) for ds in acc_datasets]
                                 acc_predictions.append(self.combine_datasets(acc_prepared))
 
-                                acc_gt_surface = self.valid_dataset.surface_inv_transform(val_target_surface.cpu()).numpy()
-                                acc_gt_upper_air = self.valid_dataset.upper_air_inv_transform(val_target_upper_air.cpu()).numpy()
+                                acc_gt_surface = self.surface_inv_gpu(val_target_surface).cpu().numpy()
+                                acc_gt_upper_air = self.upper_air_inv_gpu(val_target_upper_air).cpu().numpy()
                                 if self.params.has_diagnostic:
-                                    acc_gt_diagnostic = self.valid_dataset.diagnostic_inv_transform(val_target_diagnostic.cpu()).numpy()
+                                    acc_gt_diagnostic = self.diagnostic_inv_gpu(val_target_diagnostic).cpu().numpy()
                                     acc_gt_datasets = self.convert_to_xarray(acc_gt_surface, acc_gt_upper_air, start_times, self.params, self.valid_dataset, acc=True, diagnostic_prediction=acc_gt_diagnostic)
                                 else:
                                     acc_gt_datasets = self.convert_to_xarray(acc_gt_surface, acc_gt_upper_air, start_times, self.params, self.valid_dataset, acc=True)
                                 acc_gt_prepared = [self.prepare_preds(ds, acc=True) for ds in acc_gt_datasets]
                                 acc_ground_truths.append(self.combine_datasets(acc_gt_prepared))
 
-                            # Spectra prep
+                            # Spectra prep (selected lead times only), same
+                            # GPU-side inv-transform + single-copy pattern.
                             lead_time_indices = [lt - 1 for lt in self.params.forecast_lead_times]
-                            if self.params.diagnostic_spectra:
+                            if _need_spectra:
+                                val_output_surface_t = self.surface_inv_gpu(torch.stack(_surf_t_gpu, dim=1)).cpu().numpy()
+                                val_output_upper_air_t = self.upper_air_inv_gpu(torch.stack(_ua_t_gpu, dim=1)).cpu().numpy()
                                 if self.params.has_diagnostic:
+                                    val_output_diagnostic_t = self.diagnostic_inv_gpu(torch.stack(_diag_t_gpu, dim=1)).cpu().numpy()
                                     datasets = self.convert_to_xarray(val_output_surface_t, val_output_upper_air_t, start_times, self.params, self.valid_dataset, acc=False, diagnostic_prediction=val_output_diagnostic_t)
                                 else:
                                     datasets = self.convert_to_xarray(val_output_surface_t, val_output_upper_air_t, start_times, self.params, self.valid_dataset, acc=False)
                                 prepared_datasets = [self.prepare_preds(ds, acc=False) for ds in datasets]
                                 all_predictions.append(self.combine_datasets(prepared_datasets))
 
-                                gt_surface = self.valid_dataset.surface_inv_transform(val_target_surface[:, lead_time_indices].cpu()).numpy()
-                                gt_upper_air = self.valid_dataset.upper_air_inv_transform(val_target_upper_air[:, lead_time_indices].cpu()).numpy()
+                                gt_surface = self.surface_inv_gpu(val_target_surface[:, lead_time_indices]).cpu().numpy()
+                                gt_upper_air = self.upper_air_inv_gpu(val_target_upper_air[:, lead_time_indices]).cpu().numpy()
                                 if self.params.has_diagnostic:
-                                    gt_diagnostic = self.valid_dataset.diagnostic_inv_transform(val_target_diagnostic[:, lead_time_indices].cpu()).numpy()
+                                    gt_diagnostic = self.diagnostic_inv_gpu(val_target_diagnostic[:, lead_time_indices]).cpu().numpy()
                                     gt_datasets = self.convert_to_xarray(gt_surface, gt_upper_air, start_times, self.params, self.valid_dataset, acc=False, diagnostic_prediction=gt_diagnostic)
                                 else:
                                     gt_datasets = self.convert_to_xarray(gt_surface, gt_upper_air, start_times, self.params, self.valid_dataset, acc=False)
@@ -1526,6 +1576,9 @@ class Trainer():
         
         self.iters = checkpoint['iters']
         self.startEpoch = checkpoint['epoch']
+        # Keep the epoch counter in sync: train_one_epoch increments self.epoch,
+        # so without this a resumed run would log epochs starting from 1 again.
+        self.epoch = self.startEpoch
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scheduler_state_dict' in checkpoint:
