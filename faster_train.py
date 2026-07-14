@@ -1,6 +1,33 @@
 # ----------------------------------------------------------------------------------
-# train.py (full) — Pangu S2S trainer with DDP, AMP, compile(), SDPA fast paths,
+# faster_train.py — Pangu S2S trainer with DDP, AMP, compile(), SDPA fast paths,
 #                   throttled metrics/logging, and correctness fixes.
+#
+# Pipeline overview
+# -----------------
+# One training step teaches PanguModel_Plasim (networks/pangu.py) a single
+# timedelta_hours transition x_t -> x_{t+1} on normalized PlaSim fields:
+#
+#   data loader   -> (input_surface, input_upper_air, target_surface,
+#                     target_upper_air, [target_diagnostic], varying_boundary)
+#   model forward -> next-state (or delta) predictions + the two latent
+#                    Gaussians (mu, sigma | input) and (mu2, sigma2 | target)
+#   loss          -> 0.25 * surface (+ diagnostic) + upper-air reconstruction
+#                    (L1/L2/lat-weighted/CRPS per config)
+#                    + vae_loss_weight * KL(N(mu,sigma) || N(mu2,sigma2))
+#
+# Ensembles (num_ensemble_members = E > 1, CRPS loss): inputs stay at batch B;
+# only targets are expanded to B*E. The model runs its encoders once per sample
+# and fans out to E members at the latent bottleneck (see status.md, Issue 1).
+#
+# Validation is an autoregressive rollout: the model's output is fed back as
+# the next input up to max(forecast_lead_times) steps, scoring loss/RMSE at the
+# configured lead times plus ACC-vs-climatology, power spectra, and GIFs.
+#
+# Scaling/perf: one process per GPU via torchrun + DDP (per-GPU batch =
+# global_batch_size / world_size), BF16 autocast by default (FP16+GradScaler
+# fallback, optional FP8 through Transformer Engine on Hopper/Blackwell),
+# gradient accumulation with no_sync, optional torch.compile, fused Adam, and
+# throttled metric computation/logging.
 # ----------------------------------------------------------------------------------
 
 from tqdm import tqdm
@@ -788,17 +815,22 @@ class Trainer():
                     data_time += time.time() - data_start
 
                     tr_start = time.time()
+                    # Gradients are zeroed only at the start of each accumulation
+                    # window; the accum_steps micro-batches in between add into
+                    # the same .grad buffers, emulating a larger batch.
                     _accum_steps = max(1, int(getattr(self.params, "accum_steps", 1)))
                     if (i % _accum_steps) == 0:
                         self.optimizer.zero_grad(set_to_none=True)
 
-                    # forward + loss
+                    # forward + loss (AMP autocast inside cal_loss)
                     output_surface, output_upper_air, output_diagnostic, loss_sfc, loss_pl, loss_diagnostic, loss_vae, loss = self.cal_loss(
                         input_surface, self.constant_boundary_data, varying_boundary_data, input_upper_air,
                         target_diagnostic, target_surface, target_upper_air
                     )
 
-                    # accumulation with no_sync + optional grad clipping
+                    # Backward: on non-final micro-batches, DDP's no_sync skips the
+                    # gradient all-reduce; comms happen once per optimizer step.
+                    # scaler is a no-op under BF16 (only enabled for FP16).
                     _is_last_micro = ((i + 1) % _accum_steps == 0) or (i == len(train_data_loader) - 1)
                     if dist.is_initialized() and hasattr(self.model, "no_sync") and not _is_last_micro:
                         _sync_cm = self.model.no_sync()
@@ -820,7 +852,9 @@ class Trainer():
                     if (self.world_rank == 0) and (i % (5 * log_every) == 0):
                         logging.info(f"Backprop + step took {tr_end_time - tr_start:.4f}s")
 
-                    # Compute metrics only every N steps to reduce overhead
+                    # Diagnostics (not part of the objective): per-variable
+                    # latitude-weighted RMSE in normalized units, computed only
+                    # every metrics_every steps to keep the hot loop cheap.
                     if (i % metrics_every == 0):
                         with torch.inference_mode():
                             if self.params.predict_delta:
@@ -927,6 +961,10 @@ class Trainer():
             loss_sfc = self.loss_obj_sfc(output_surface, target_surface)
             loss_pl = self.loss_obj_pl(output_upper_air, target_upper_air)
 
+            # Objective: upper-air reconstruction at full weight, surface
+            # (+ diagnostic) down-weighted by 0.25 (Pangu-Weather's weighting),
+            # plus the CVAE KL term KL(N(mu,sigma) || N(mu2,sigma2)) scaled by
+            # vae_loss_weight when enabled.
             if self.params.has_diagnostic:
                 loss = (loss_sfc + loss_diagnostic) * 0.25 + loss_pl
             else:
@@ -1013,6 +1051,9 @@ class Trainer():
             return logs
 
     def inti_valid_loss(self, lead_times_steps) -> tuple:
+        # valid_buff packs the scalar accumulators (loss, sfc, pl, [diag],
+        # batch count) into ONE tensor so a single all_reduce syncs them all;
+        # the named variables below are views aliasing into it.
         if self.params.has_diagnostic:
             valid_buff = torch.zeros((5), dtype=torch.float32, device=self.device)
             valid_loss_diag = valid_buff[3].view(-1)
@@ -1042,6 +1083,17 @@ class Trainer():
         return valid_loss_diag, valid_buff, valid_loss, valid_loss_sfc, valid_loss_pl, valid_steps, valid_surface_lwrmse, valid_upper_air_lwrmse, valid_diagnostic_lwrmse, multi_step_losses, multi_step_rmse
 
     def validate_one_epoch(self):
+        """Autoregressive rollout validation.
+
+        Each validation sample is stepped max(forecast_lead_times) times, with
+        every prediction fed back as the next input (the deployment regime,
+        unlike the single-step training objective). Loss and lat-weighted RMSE
+        are accumulated only at the configured lead times; the full
+        denormalized trajectory is kept on CPU for the ACC-vs-climatology,
+        power-spectrum, and GIF diagnostics. Note: unlike training, ensemble
+        mode expands the INPUTS to B*E here, so each member rolls out its own
+        trajectory from the shared initial condition.
+        """
         if world_rank == 0:
             print("Validating...")
         self.model.eval()
@@ -1127,6 +1179,9 @@ class Trainer():
                                                    val_input_upper_air.shape[3], val_input_upper_air.shape[4]), dtype=np.float32)
 
                 step_idx = 0
+                # Rollout: one forward = one timedelta_hours step. Constant
+                # boundaries are reused; varying boundaries (TOA solar) are
+                # indexed per step since they follow the forecast time.
                 for step in range(max_lead_time):
                     if self.params.has_diagnostic:
                         val_output_surface, val_output_upper_air, val_output_diagnostic, _, _  = self.model(
@@ -1158,6 +1213,8 @@ class Trainer():
                                 valid_loss_diag += loss_diag
 
                     if self.params.predict_delta:
+                        # Convert the predicted (normalized) increment into a full
+                        # state before scoring RMSE and feeding it back as input.
                         val_output_surface, val_output_upper_air = self.integrator(val_input_surface, val_input_upper_air, val_output_surface, val_output_upper_air)
 
                     val_output_surface_acc[:, step] = self.valid_dataset.surface_inv_transform(val_output_surface.cpu()).numpy()
@@ -1225,6 +1282,8 @@ class Trainer():
                                 all_ground_truths.append(self.combine_datasets(gt_prepared))
                         step_idx += 1
 
+                    # Autoregressive feedback: this step's prediction becomes
+                    # the next step's input state.
                     val_input_surface, val_input_upper_air = val_output_surface, val_output_upper_air
 
                 del val_output_surface, val_output_upper_air, val_input_surface, val_input_upper_air, val_target_surface, val_target_upper_air
