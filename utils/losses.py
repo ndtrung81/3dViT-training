@@ -119,15 +119,14 @@ class Latitude_weighted_CRPSLoss(_Loss):
         return weighted_mae(input, target, self.latitudes, reduction='none').mean(dim=0)
     
     def CRPSSpread(self, input: Tensor, target: Tensor) -> Tensor:
-        # compute (1/(M-1)) * mean(x_i - x_j) summed over all i,j
-        # only compute for i<j since sum is symmetric
-        spread = torch.zeros_like(input[0])
-        for i in range(input.shape[0]):
-            for j in range(i+1, input.shape[0]):
-                spread += 2 * weighted_mae(input[i], target[j], self.latitudes, reduction='none')
-        prefactor = 1 / (self.num_ensemble_members * (self.num_ensemble_members - 1))
-        spread = prefactor * spread
-        return spread
+        # All pairwise |x_i - x_j|: (M, 1, ...) - (1, M, ...) = (M, M, ...)
+        # Diagonal entries are zero, so summing all pairs equals summing i != j.
+        M = input.shape[0]
+        abs_diff = torch.abs(input.unsqueeze(1) - input.unsqueeze(0))
+        pair_sum = abs_diff.sum(dim=(0, 1))  # sum over all (i, j) pairs
+        reshape_shape = tuple(1 if i != len(pair_sum.shape) - 2 else -1 for i in range(len(pair_sum.shape)))
+        weight = torch.reshape(latitude_weighting_factor_torch(self.latitudes), reshape_shape)
+        return torch.mean(weight * pair_sum) / (M * (M - 1))
     
 
 

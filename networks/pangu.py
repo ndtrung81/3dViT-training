@@ -89,8 +89,41 @@ USE_TE = False
 
 class PanguModel_Plasim(nn.Module):
     """
-    Pangu A PyTorch impl of: `Pangu-Weather: A 3D High-Resolution Model for Fast and Accurate Global Weather Forecast`
-    - https://arxiv.org/abs/2211.02556
+    Pangu-Weather adapted to PlaSim data, extended into a stochastic (VAE-style)
+    ensemble forecast model. Base architecture: `Pangu-Weather: A 3D High-Resolution
+    Model for Fast and Accurate Global Weather Forecast` - https://arxiv.org/abs/2211.02556
+
+    Data layout
+    -----------
+    The atmosphere at one time step is a 3D grid [pressure levels, lat, lon] of
+    upper-air variables plus a 2D grid [lat, lon] of surface variables. Both are
+    tokenized by strided convolutions (PatchEmbed3D / PatchEmbed2D) and the surface
+    token plane is stacked onto the upper-air token cube as one extra "pressure
+    level" (plus one more plane for the TOA-solar boundary if upper_air_boundary).
+    The result is a single token cube [Pl, Lat, Lon] with embed_dim channels,
+    flattened to a sequence of length Pl*Lat*Lon for the transformer layers.
+
+    Architecture (U-Net-shaped, Swin-style 3D windowed attention)
+    -------------------------------------------------------------
+        encoder 1 (input x_t):   layer1 (full res) -> DownSample (2x lat/lon merge,
+                                 channels x2) -> layer2 -> layer3
+        VAE bottleneck:          1x1 convs give (mu, sigma) of a latent Gaussian
+                                 conditioned on the input; reparameterized noise is
+                                 projected (layer_purturbation) and ADDED to the
+                                 deterministic encoder output -> stochastic decoder input
+        encoder 2 (train only):  identical stack run on the TARGET x_{t+1}; its
+                                 (mu_e2, sigma_e2) define the target-conditioned
+                                 distribution the KL loss pulls (mu, sigma) toward
+                                 (CVAE-style; encoder 2 is discarded at inference)
+        decoder:                 UpSample -> layer4 (full res) -> concat with the
+                                 skip from layer1 (2*embed_dim channels) ->
+                                 PatchRecovery2D/3D (transposed or sub-pixel conv)
+                                 back to physical [lat, lon] / [levels, lat, lon] grids
+
+    Outputs are either the full next state or a normalized increment
+    (predict_delta), and land/ocean-only variables can be masked to their domain.
+    Ensembles: with num_ensemble_members=E > 1, encoders run once per sample and E
+    latent draws fan the batch out to B*E only from the bottleneck onward.
 
     Args:
         embed_dim (int): Patch embedding dimension. Default: 192
@@ -247,7 +280,13 @@ class PanguModel_Plasim(nn.Module):
         self.idx_surface_var_bound = [i for i in range(self.num_varying_boundary_vars) if i != self.idx_upper_air_var_bound]
 
 
-        # In addition, three constant masks(the topography mask, land-sea mask and soil type mask)        
+        # --- Patch embedding (tokenizer) ---------------------------------------
+        # Strided convs cut the globe into patches and project each patch to
+        # embed_dim channels. Surface fields are embedded together with the
+        # constant boundary masks (topography, land-sea, ...) and the surface-type
+        # varying boundaries; the TOA incident solar radiation (an upper-air
+        # forcing) optionally gets its own 2D embedding so it can occupy a
+        # separate plane in the token cube.
         if self.upper_air_boundary:
             self.patchembed2d_upper_air_boundary = PatchEmbed2D(
                 img_size=params.horizontal_resolution,
@@ -269,9 +308,12 @@ class PanguModel_Plasim(nn.Module):
             in_chans=self.num_atmo_vars,
             embed_dim=embed_dim)
         
+        # Token-cube resolutions seen by the transformer stages.
+        # Vertical extent = embedded pressure levels + 1 surface plane
+        # (+ 1 TOA-boundary plane when upper_air_boundary is set).
         EST_input_resolution = (self.patchembed3d.output_size[0]+1+1*self.upper_air_boundary, self.patchembed3d.output_size[1], self.patchembed3d.output_size[2])
 
-        
+        # DownSample halves lat/lon (updown_scale_factor) but never the vertical.
         downscale_resolution = (self.patchembed3d.output_size[0]+1+1*self.upper_air_boundary,
                                 (self.patchembed2d.output_size[0] - self.patchembed2d.output_size[0] % params.updown_scale_factor) \
                                 // params.updown_scale_factor + self.patchembed2d.output_size[0] % params.updown_scale_factor,
@@ -281,10 +323,14 @@ class PanguModel_Plasim(nn.Module):
         self.downscale_resolution = downscale_resolution # (10, 23, 45)
         self.EST_input_resolution = EST_input_resolution #(10, 45, 90)
 
+        # vertical_windowing=False: one attention window spans the whole column,
+        # so every token attends across all pressure levels (no vertical shift).
         if not self.vertical_windowing:
             self.window_size[0] = EST_input_resolution[0]
 
-
+        # --- Encoder 1: runs on the INPUT state x_t --------------------------
+        # layer1 at full token resolution; layers 2-3 at the downsampled
+        # resolution with doubled channels (Swin-style stage hierarchy).
         self.layer1 = EarthSpecificLayer(
             dim=embed_dim,
             input_resolution=EST_input_resolution,
@@ -324,16 +370,26 @@ class PanguModel_Plasim(nn.Module):
             checkpointing = self.checkpointing,
             use_reentrant = self.use_reentrant)
         
-        #############VAE part #############
+        ############# VAE bottleneck (encoder 1 / "prior" branch) #############
+        # 1x1 convs map the bottleneck features [B, 2*embed_dim, Pl, Lat', Lon']
+        # to the mean and log-variance of a per-voxel latent Gaussian. A sample
+        # from it is projected back to bottleneck width (layer_purturbation) and
+        # added to the deterministic features — this is the only source of
+        # ensemble spread. (layer_perturbation2 is a currently unused variant
+        # that concatenates instead of adds.)
         self.layer_mu =  nn.Conv3d(in_channels=self.embed_dim * params.updown_scale_factor, out_channels=self.embed_dim, kernel_size=1)
         self.layer_sigma = nn.Conv3d(in_channels=self.embed_dim * params.updown_scale_factor, out_channels=self.embed_dim, kernel_size=1)
         self.layer_purturbation = nn.Conv3d(in_channels=embed_dim, out_channels=embed_dim*2, kernel_size=1)
-        self.layer_perturbation2 = nn.Conv3d(in_channels=embed_dim + embed_dim * params.updown_scale_factor, 
+        self.layer_perturbation2 = nn.Conv3d(in_channels=embed_dim + embed_dim * params.updown_scale_factor,
                                              out_channels=embed_dim * params.updown_scale_factor, kernel_size=1)
-        #############VAE part ############# 
-        
+        #############VAE part #############
 
-        ############2nd Encoder #############
+
+        ############ Encoder 2 ("posterior" branch, training only) #############
+        # A second, independently-weighted copy of the encoder that sees the
+        # TARGET state x_{t+1}. Its (mu_e2, sigma_e2) are never sampled from;
+        # they only feed the KL term that regularizes encoder 1's latent toward
+        # a distribution that knows the true outcome (CVAE objective).
         self.layer1_e2 = EarthSpecificLayer(
             dim=embed_dim,
             input_resolution=EST_input_resolution,
@@ -378,9 +434,10 @@ class PanguModel_Plasim(nn.Module):
 
 
 
-        self.upsample = UpSample(embed_dim * params.updown_scale_factor, embed_dim, downscale_resolution, 
+        # --- Decoder: perturbed bottleneck -> full resolution -----------------
+        self.upsample = UpSample(embed_dim * params.updown_scale_factor, embed_dim, downscale_resolution,
                                  (self.patchembed3d.output_size[0]+1+1*self.upper_air_boundary, self.patchembed3d.output_size[1], self.patchembed3d.output_size[2]))
-        
+
         self.layer4 = EarthSpecificLayer(
             dim=embed_dim,
             input_resolution=EST_input_resolution,
@@ -397,6 +454,12 @@ class PanguModel_Plasim(nn.Module):
 
 
         
+        # --- Patch recovery (de-tokenizer) ------------------------------------
+        # Inverse of patch embedding: maps decoder tokens (2*embed_dim because
+        # of the layer1 skip concat) back to physical grids. Either plain
+        # transposed convs (PatchRecovery*) or sub-pixel convolution variants
+        # (pixel-shuffle with ICNR init, optionally per-variable heads and polar
+        # padding) that avoid checkerboard patch artifacts.
         if self.subpixel_deconv:
             if self.recovery_head:
                 from utils.patch_recovery import SubPixelConvICNR_2D_wHead as SubPixelConv_2D
@@ -430,24 +493,43 @@ class PanguModel_Plasim(nn.Module):
 
     def reparameterize(self, mu, sigma):
             std = torch.exp(0.5 * sigma)
-            eps = torch.randn_like(std)
+            # torch.randn rather than randn_like: randn_like fills values in the
+            # input's memory order, so the noise realization would depend on
+            # sigma's strides (conv output is permuted, repeat_interleave output
+            # is contiguous). A plain contiguous draw is layout-independent.
+            eps = torch.randn(std.size(), dtype=std.dtype, device=std.device)
             return mu + eps * std
     
-    def forward(self, surface_in, constant_boundary, varying_boundary, upper_air_in, 
-                     target_surface=None, target_upper_air=None, train = False):
+    def forward(self, surface_in, constant_boundary, varying_boundary, upper_air_in,
+                     target_surface=None, target_upper_air=None, train = False, num_ensemble_members = 1):
         """
         Args:
-            surface (torch.Tensor): 2D n_lat=721, n_lon=1440, chans=4.
-            surface_mask (torch.Tensor): 2D n_lat=721, n_lon=1440, chans=3.
-            upper_air (torch.Tensor): 3D n_pl=13, n_lat=721, n_lon=1440, chans=5.
+            surface_in (torch.Tensor): [B, n_surface_vars, lat, lon] normalized surface fields.
+            constant_boundary (torch.Tensor): [(B,) n_const, lat, lon] static masks
+                (topography, land-sea mask, ...), concatenated onto the surface channels.
+            varying_boundary (torch.Tensor): [B, n_varying, lat, lon] time-dependent
+                forcings (e.g. TOA incident solar radiation) for this step.
+            upper_air_in (torch.Tensor): [B, n_atmo_vars, levels, lat, lon] normalized
+                upper-air fields.
+            target_surface, target_upper_air (torch.Tensor): the NEXT state x_{t+1};
+                only required when train=True, where they feed encoder 2 (posterior
+                branch) to produce (mu_e2, sigma_e2) for the KL loss.
             train (bool): If True, the model will be trained, otherwise it will be evaluated.
+            num_ensemble_members (int): If > 1, the encoders run once per sample (batch B)
+                and E ensemble members are sampled at the latent bottleneck; the decoder
+                then runs at batch B*E. Members of a sample are contiguous in the output
+                ([s0m0, s0m1, ..., s1m0, ...]), matching the [B, E, ...] grouping used by
+                the CRPS loss.
         """
         
         
         if len(constant_boundary.size()) == 3:
             constant_boundary = constant_boundary.unsqueeze(0)
 
-        ##############Data Preparation for Encoder 1############################
+        ############## Data preparation for encoder 1 ############################
+        # Embed surface (+ boundary) fields to a 2D token plane and upper-air
+        # fields to a 3D token cube, then stack them along the vertical (dim=2):
+        # [TOA-boundary plane,] upper-air levels, surface plane.
         if self.upper_air_boundary:
             upper_air_varying_boundary = varying_boundary[:,self.idx_upper_air_var_bound, :, :].unsqueeze(1)
             surface_varying_boundary = varying_boundary[:,self.idx_surface_var_bound, :, :]
@@ -466,14 +548,15 @@ class PanguModel_Plasim(nn.Module):
             x = torch.concat([upper_air, surface.unsqueeze(2)], dim=2)
 
         B, C, Pl, Lat, Lon = x.shape
-        
+
+        # Flatten token cube to a transformer sequence: [B, Pl*Lat*Lon, C]
         x = x.reshape(B, C, -1).transpose(1, 2)
 
         if train:
-            ##############Data Preparation for Encoder 2############################
+            ############## Data preparation for encoder 2 (target state) ############
             if self.upper_air_boundary:
                 surface_target = torch.cat([target_surface, constant_boundary, surface_varying_boundary], dim=1)
-                surface_target = self.patchembed2d(surface)
+                surface_target = self.patchembed2d(surface_target)
                 target_upper_air = self.patchembed3d(target_upper_air)
                 x_target = torch.cat([upper_air_varying_boundary.unsqueeze(2), target_upper_air, surface_target.unsqueeze(2)], dim=2)
 
@@ -486,50 +569,65 @@ class PanguModel_Plasim(nn.Module):
             x_target = x_target.reshape(B, C, -1).transpose(1, 2)  #8, 40500, 192
 
 
+        ############## Encoder 1 (input) ##########################################
         x = self.layer1(x)
         if train:
             x_e2 = self.layer1_e2(x_target)
             x_e2 = self.downsample_e2(x_e2)
 
-        skip = x
-        x = self.downsample(x) #8, 10350, 384
+        skip = x                # full-resolution features, concatenated after the decoder
+        x = self.downsample(x)  # [B, Pl*Lat'*Lon', 2*embed_dim]
         x = self.layer2(x)
         x = self.layer3(x)
+        # Back to conv layout [B, 2*embed_dim, Pl, Lat', Lon'] for the 1x1 VAE convs
         x = x.reshape(B, self.downscale_resolution[0], self.downscale_resolution[1], self.downscale_resolution[2], -1).permute(0, 4, 1, 2, 3)
-        
-        x_vae = x #8, 10, 23, 45, 384
-        # reshape(B, self.downscale_resolution[0],self.downscale_resolution[1],self.downscale_resolution[2],-1).permute(0, 4, 1, 2, 3) # should be #8, 10,23,45, 384
-        # print("x_vae reshaped after ", x_vae.shape) 
-        ###########VAE Enocer 1#################
-        mu = self.layer_mu(x_vae) # should be #8,192, 10,23,45, 
-        sigma = self.layer_sigma(x_vae) # should be #8, 192, 10,23,45, 
-        norm = self.reparameterize(mu, sigma) # should be #8,192, 10,23,45
-        x_purb = self.layer_purturbation(norm)
-        #print("mu, sigma, norm, x_purb", mu.shape, sigma.shape, norm.shape, x_purb.shape) #8, 10, 23, 45, 192
 
-        ###########VAE Enocer 1#################
+        x_vae = x
+        ########### VAE bottleneck: sample latent from input-conditioned Gaussian ####
+        mu = self.layer_mu(x_vae) # should be #8,192, 10,23,45,
+        sigma = self.layer_sigma(x_vae) # should be #8, 192, 10,23,45,
+        if num_ensemble_members > 1:
+            # Encoder diversity comes only from the noise below, so sample E members
+            # per input here instead of running the encoders on E identical copies.
+            norm = self.reparameterize(mu.repeat_interleave(num_ensemble_members, dim=0),
+                                       sigma.repeat_interleave(num_ensemble_members, dim=0))
+        else:
+            norm = self.reparameterize(mu, sigma) # should be #8,192, 10,23,45
+        x_purb = self.layer_purturbation(norm)  # project latent back to bottleneck width (2*embed_dim)
+
         if train:
-            ###########VAE Enocer 2#################
+            ########### Encoder 2: target-conditioned (mu_e2, sigma_e2) for the KL loss ####
+            # Checkpointed: activations are recomputed in backward to save memory.
             x_e2 = checkpoint(self.layer2_e2, x_e2, use_reentrant=self.use_reentrant)
             x_e2 = checkpoint(self.layer3_e3, x_e2, use_reentrant=self.use_reentrant)
-            x_e2_vae = x_e2.reshape(B, self.downscale_resolution[0], self.downscale_resolution[1], self.downscale_resolution[2], -1).permute(0, 4, 1, 2, 3) 
+            x_e2_vae = x_e2.reshape(B, self.downscale_resolution[0], self.downscale_resolution[1], self.downscale_resolution[2], -1).permute(0, 4, 1, 2, 3)
 
-            mu_e2 = self.layer_mu_e2(x_e2_vae) 
+            mu_e2 = self.layer_mu_e2(x_e2_vae)
             sigma_e2 = self.layer_sigma_e2(x_e2_vae)
-            norm_e2 = self.reparameterize(mu_e2, sigma_e2) 
 
 
-        ##############Decoder ##################
-        x  = x_purb  +  x
+        ############## Decoder ##################
+        # Ensemble fan-out happens here: deterministic features are replicated to
+        # B*E and each copy gets its own latent draw; everything upstream ran at B.
+        if num_ensemble_members > 1:
+            x = x.repeat_interleave(num_ensemble_members, dim=0)
+            skip = skip.repeat_interleave(num_ensemble_members, dim=0)
+            B = B * num_ensemble_members
+        x  = x_purb  +  x   # inject stochastic perturbation into the bottleneck
         #x = self.layer_perturbation2(x) #8, 384, 10, 23, 45
-        x = x.permute(0, 2, 3,4, 1).reshape(B, -1, self.embed_dim * self.updown_scale_factor) #8, 10350, 384
+        x = x.permute(0, 2, 3,4, 1).reshape(B, -1, self.embed_dim * self.updown_scale_factor)  # back to sequence layout
         x = self.upsample(x)
         x = self.layer4(x)
 
-
+        # U-Net skip: concat full-res encoder features -> 2*embed_dim channels,
+        # then restore the [B, C, Pl, Lat, Lon] token cube for patch recovery.
         output = torch.concat([x, skip], dim=-1)
         output = output.transpose(1, 2).reshape(B, -1, Pl, Lat, Lon)
 
+        # Split the token cube back into its planes: last vertical slot is the
+        # surface plane, the first slot is the TOA-boundary plane (discarded),
+        # the rest are upper-air levels. Patch recovery then upsamples each part
+        # to the physical grid; land/ocean-only variables are optionally masked.
         if self.predict_delta:
             output_surface_delta  = output[:, :, -1, :, :]
             if self.upper_air_boundary:
@@ -546,7 +644,7 @@ class PanguModel_Plasim(nn.Module):
                     self.land_mask(output_surface[:, self.num_surface_vars: self.num_surface_vars + self.num_land_vars]).to(output_surface.dtype)
             if self.has_ocean and self.mask_output:
                 output_surface[:, self.num_surface_vars + self.num_land_vars:] = \
-                    self.land_mask(output_surface[:, self.num_surface_vars + self.num_land_vars:]).to(output_surface.dtype)
+                    self.ocean_mask(output_surface[:, self.num_surface_vars + self.num_land_vars:]).to(output_surface.dtype)
             if self.checkpointing > 0 and train:
                 output_upper_air = checkpoint(self.patchrecovery3d, output_upper_air_delta, use_reentrant=self.use_reentrant)
             else:
@@ -567,7 +665,7 @@ class PanguModel_Plasim(nn.Module):
                     self.land_mask(output_surface[:, self.num_surface_vars: self.num_surface_vars + self.num_land_vars]).to(output_surface.dtype)
             if self.has_ocean and self.mask_output:
                 output_surface[:, self.num_surface_vars + self.num_land_vars:] = \
-                    self.land_mask(output_surface[:, self.num_surface_vars + self.num_land_vars:]).to(output_surface.dtype)
+                    self.ocean_mask(output_surface[:, self.num_surface_vars + self.num_land_vars:]).to(output_surface.dtype)
             if self.checkpointing > 0 and train:
                 output_upper_air = checkpoint(self.patchrecovery3d, output_upper_air, use_reentrant=self.use_reentrant)
             else:
@@ -662,6 +760,15 @@ class PatchRecovery:
 '''
 
 class Mask(nn.Module):
+    """
+    Restrict a field to its physical domain (e.g. soil moisture over land only).
+
+    mask is a fixed 0/1 [lat, lon] field stored as a frozen (requires_grad=False)
+    parameter so it moves with the model across devices/dtypes. In full-field
+    mode a mask_fill tensor replaces the out-of-domain region with each
+    variable's fill value; in delta mode the fill is omitted, leaving 0 there
+    (= "no change"), which is the correct increment outside the domain.
+    """
     def __init__(self, mask, mask_fill = None):
         super().__init__() 
         self.mask = nn.parameter.Parameter(mask.unsqueeze(0).unsqueeze(0), requires_grad=False)
@@ -679,8 +786,13 @@ class Mask(nn.Module):
 
 class DownSample(nn.Module):
     """
-    Down-sampling operation
+    Down-sampling operation (Swin patch merging, lat/lon only).
     Implementation from: https://github.com/198808xc/Pangu-Weather/blob/main/pseudocode.py
+
+    Space-to-depth: each factor x factor lat/lon block of tokens is concatenated
+    along channels (C -> factor^2 * C), normalized, then linearly reduced to
+    factor * C. Halves horizontal resolution while doubling width; the vertical
+    (pressure-level) axis is never downsampled.
 
     Args:
         in_dim (int): Number of input channels.
@@ -738,8 +850,12 @@ class DownSample(nn.Module):
 
 class UpSample(nn.Module):
     """
-    Up-sampling operation.
+    Up-sampling operation (inverse of DownSample).
     Implementation from: https://github.com/198808xc/Pangu-Weather/blob/main/pseudocode.py
+
+    Depth-to-space: a linear layer expands channels to factor^2 * out_dim, the
+    factor^2 sub-pixels are rearranged into a factor x factor lat/lon block
+    (pixel shuffle), then the padding introduced by DownSample is cropped off.
 
     Args:
         in_dim (int): Number of input channels.
@@ -835,11 +951,15 @@ class EarthSpecificLayer(nn.Module): #BasicLayer(nn.Module):
         ])
 
     def forward(self, x):
+        # Activation-checkpointing levels (params.checkpointing):
+        #   0  = off; >0 = patch recovery is checkpointed in the model forward;
+        #   >2 = additionally recompute every attention block here in backward
+        #        (max memory saving, at the cost of a second forward pass).
         for blk in self.blocks:
-            # if self.checkpointing > 2 and train:
-            #     x = checkpoint(blk, x, use_reentrant=self.use_reentrant)
-            # else:
-            x = blk(x)
+            if self.checkpointing > 2 and self.training:
+                x = checkpoint(blk, x, use_reentrant=self.use_reentrant)
+            else:
+                x = blk(x)
         return x
 
 
@@ -848,7 +968,17 @@ class EarthSpecificLayer(nn.Module): #BasicLayer(nn.Module):
 
 class EarthSpecificBlock(nn.Module):
     """
-    3D Transformer Block
+    3D Transformer Block: (shifted-)window attention + MLP, pre-norm residual.
+
+    Swin-style locality: attention is computed only inside 3D windows of
+    window_size = (win_pl, win_lat, win_lon) tokens. Consecutive blocks in a
+    layer alternate between non-shifted (shift_size=(0,0,0)) and shifted
+    windows (shift by half a window), which lets information propagate across
+    window borders without global attention. Because longitude is periodic,
+    the shift is implemented with torch.roll (wrap-around is physically
+    correct there); the attn_mask cancels attention between tokens that were
+    wrapped together across the non-periodic latitude/pressure boundaries.
+
     Args:
         dim (int): Number of input channels.
         input_resolution (tuple[int]): Input resolution.
@@ -930,7 +1060,8 @@ class EarthSpecificBlock(nn.Module):
 
         x = x.view(B, Pl, Lat, Lon, C)
 
-        # start pad
+        # Zero-pad Pl/Lat/Lon up to multiples of the window size so the cube
+        # tiles exactly into windows (cropped away again after attention).
         x = self.pad(x.permute(0, 4, 1, 2, 3)).permute(0, 2, 3, 4, 1)
 
         _, Pl_pad, Lat_pad, Lon_pad, _ = x.shape
@@ -938,6 +1069,9 @@ class EarthSpecificBlock(nn.Module):
         shift_pl, shift_lat, shift_lon = self.shift_size
 
         if self.roll:
+            # Shifted-window block: roll the cube by half a window. Longitude
+            # wraps periodically (correct on a sphere); latitude/pressure wraps
+            # are masked out in the attention via self.attn_mask.
             shifted_x = torch.roll(x, shifts=(-shift_pl, -shift_lat, -shift_lon), dims=(1, 2, 3))
             x_windows = window_partition(shifted_x, self.window_size)
             # B*num_lon, num_pl*num_lat, win_pl, win_lat, win_lon, C
@@ -981,6 +1115,19 @@ class EarthAttention3D(nn.Module):
     """
     3D window attention with earth position bias.
     It supports both of shifted and non-shifted window.
+
+    This is Pangu's key departure from vanilla Swin: instead of one relative
+    position bias shared by all windows, the bias table has an extra
+    `type_of_windows` axis (= num_pl_windows * num_lat_windows). Windows at
+    different latitudes/pressure levels cover physically different geometry
+    (grid cells shrink toward the poles; vertical spacing is non-uniform), so
+    each (pl, lat) window position learns its OWN bias, while windows along
+    longitude share it (the sphere is symmetric under rotation about its
+    axis). This is also why window tensors keep the shape
+    [B*num_lon, num_pl*num_lat, N, C] rather than flattening all windows into
+    the batch dim. Along longitude the bias is indexed by relative position
+    (2*Wlon-1 values, translation-invariant); along pl and lat it is indexed
+    by the absolute pair (Wpl^2, Wlat^2 values).
 
     Args:
         dim (int): Number of input channels.
@@ -1048,8 +1195,13 @@ class EarthAttention3D(nn.Module):
         )  # Wpl*Wlat*Wlon, Wpl*Wlat*Wlon, num_pl*num_lat, nH
         earth_position_bias = earth_position_bias.permute(
             3, 2, 0, 1).contiguous().unsqueeze(0)  # nH, num_pl*num_lat, Wpl*Wlat*Wlon, Wpl*Wlat*Wlon
-        #with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+        # SDPA with the bias (+ shift mask) passed as attn_mask. The 5D/6D
+        # shapes with a per-window additive bias keep this on the math kernel;
+        # flash/mem-efficient SDPA cannot be used here.
         if mask is not None:
+            # Shifted windows: fold the num_lon window axis out of the batch so
+            # the shift mask [num_lon, num_pl*num_lat, N, N] broadcasts, and add
+            # -inf entries that decouple tokens wrapped across lat/pl borders.
             nLon = mask.shape[0]
             x = F.scaled_dot_product_attention(q.view(B_ // nLon, nLon, self.num_heads, nW_, N, L),
                                                     k.view(B_ // nLon, nLon, self.num_heads, nW_, N, L),
@@ -1069,6 +1221,8 @@ class EarthAttention3D(nn.Module):
 
   
 class Mlp(nn.Module):
+    """Standard transformer feed-forward: Linear -> GELU -> Linear, dropout after
+    each, hidden width = mlp_ratio * dim (4x by default)."""
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features

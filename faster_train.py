@@ -1,6 +1,33 @@
 # ----------------------------------------------------------------------------------
-# train.py (full) — Pangu S2S trainer with DDP, AMP, compile(), SDPA fast paths,
+# faster_train.py — Pangu S2S trainer with DDP, AMP, compile(), SDPA fast paths,
 #                   throttled metrics/logging, and correctness fixes.
+#
+# Pipeline overview
+# -----------------
+# One training step teaches PanguModel_Plasim (networks/pangu.py) a single
+# timedelta_hours transition x_t -> x_{t+1} on normalized PlaSim fields:
+#
+#   data loader   -> (input_surface, input_upper_air, target_surface,
+#                     target_upper_air, [target_diagnostic], varying_boundary)
+#   model forward -> next-state (or delta) predictions + the two latent
+#                    Gaussians (mu, sigma | input) and (mu2, sigma2 | target)
+#   loss          -> 0.25 * surface (+ diagnostic) + upper-air reconstruction
+#                    (L1/L2/lat-weighted/CRPS per config)
+#                    + vae_loss_weight * KL(N(mu,sigma) || N(mu2,sigma2))
+#
+# Ensembles (num_ensemble_members = E > 1, CRPS loss): inputs stay at batch B;
+# only targets are expanded to B*E. The model runs its encoders once per sample
+# and fans out to E members at the latent bottleneck (see status.md, Issue 1).
+#
+# Validation is an autoregressive rollout: the model's output is fed back as
+# the next input up to max(forecast_lead_times) steps, scoring loss/RMSE at the
+# configured lead times plus ACC-vs-climatology, power spectra, and GIFs.
+#
+# Scaling/perf: one process per GPU via torchrun + DDP (per-GPU batch =
+# global_batch_size / world_size), BF16 autocast by default (FP16+GradScaler
+# fallback, optional FP8 through Transformer Engine on Hopper/Blackwell),
+# gradient accumulation with no_sync, optional torch.compile, fused Adam, and
+# throttled metric computation/logging.
 # ----------------------------------------------------------------------------------
 
 from tqdm import tqdm
@@ -10,7 +37,10 @@ from ruamel.yaml.comments import CommentedMap as ruamelDict
 from ruamel.yaml import YAML
 from collections import OrderedDict
 import matplotlib.pyplot as plt
-#import wandb
+try:
+    import wandb  # only exercised when params.log_to_wandb is set
+except ImportError:
+    wandb = None
 from itertools import product
 import time
 from multiprocessing import Process
@@ -48,6 +78,14 @@ try:
     from torch.backends.cuda import sdp_kernel as _sdp_kernel
 except Exception:
     _sdp_kernel = None
+
+# Optional Transformer Engine for FP8 on Hopper (SM 9.0) and Blackwell (SM 10.0+)
+try:
+    import transformer_engine.pytorch as te
+    _te_available = True
+except ImportError:
+    te = None
+    _te_available = False
 
 from utils import logging_utils
 from utils.power_spectrum import *
@@ -123,22 +161,18 @@ def weighted_rmse_torch_3D(pred, target, latitudes=None, weight=None):
     result = torch.sqrt(torch.mean(weight * (pred - target)**2., dim=(-1, -2)))
     return result
 
-def grad_norm(model):
-    total_norm = 0.0
-    parameters = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
-    for p in parameters:
-        param_norm = p.grad.detach().data.norm(2)
-        total_norm += param_norm.item() ** 2
-    return total_norm ** 0.5
+def grad_norm_and_max(model):
+    """Grad L2-norm and abs-max in one pass, returned as device tensors.
 
-def grad_max(model):
-    max_grad = 0.0
-    parameters = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
-    for p in parameters:
-        param_max = torch.max(torch.abs(p.grad.detach().data))
-        if max_grad < param_max.item():
-            max_grad = param_max.item()
-    return param_max
+    No per-parameter .item(): each one forces a host-device sync (hundreds per
+    call on this model); the only sync is deferred to logging time.
+    """
+    params = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
+    if not params:
+        return torch.tensor(0.0), torch.tensor(0.0)
+    norms = torch.stack([p.grad.detach().norm(2) for p in params])
+    maxes = torch.stack([p.grad.detach().abs().max() for p in params])
+    return norms.norm(2), maxes.max()
 
 def evaluate_iterative_forecast(da_fc, da_true, func, clim, mean_dims=['lat', 'lon', 'time'], weighted=True):
     scores = []
@@ -193,8 +227,15 @@ def compute_weighted_acc(da_fc, da_true, clim=None, weighted=True, mean_dims=xr.
     return acc
 
 def to_ensemble_batch(data, ens_members):
-    """Convert batch of M samples (M, ...) to a batch of (M*ens_members, ...)."""
-    return (data.unsqueeze(1) * torch.ones(1, ens_members, *data.shape[1:]).to(data.device)).flatten(0, 1)
+    """Convert batch of M samples (M, ...) to a batch of (M*ens_members, ...).
+
+    Members of a sample are contiguous ([s0, s0, ..., s1, s1, ...]), matching the
+    [B, E, ...] grouping used by the CRPS loss and the model's latent-space sampling.
+    expand() is a zero-copy view and the reshape materializes it with a plain
+    copy kernel — faster than repeat_interleave, which builds an index tensor
+    and gathers.
+    """
+    return data.unsqueeze(1).expand(-1, ens_members, *data.shape[1:]).reshape(-1, *data.shape[1:])
 
 # ------------------------------------
 # Trainer
@@ -222,8 +263,9 @@ class Trainer():
         self.get_dataset()
         self.spectra_dir, self.diagnostics_dir, self.output_dir = self.create_dirs(self.run_uuid)
 
-        # AMP dtype selection (bf16 preferred for H100)
+        # AMP dtype selection (bf16 preferred for H100/B300; fp8 via Transformer Engine for Blackwell)
         amp_choice = getattr(self.params, "amp_dtype", "auto")
+        self.use_fp8 = False
         if amp_choice == "bf16" and torch.cuda.is_available():
             self.amp_dtype = torch.bfloat16
         elif amp_choice == "fp16" and torch.cuda.is_available():
@@ -231,6 +273,27 @@ class Trainer():
         elif amp_choice == "fp32":
             self.amp_dtype = torch.float32
             logging.info("Using FP32 (no mixed precision)")
+        elif amp_choice == "fp8":
+            # FP8 requires NVIDIA Transformer Engine + Hopper (SM 9.0) or Blackwell (SM 10.0+).
+            # The model uses standard nn.Linear, so TE's fp8_autocast() is applied as an outer
+            # context alongside BF16 autocast. Full FP8 throughput would require replacing
+            # nn.Linear with te.Linear in networks/pangu.py — this enables the path safely.
+            if _te_available and torch.cuda.is_available():
+                _sm_major = torch.cuda.get_device_properties(self.device).major
+                if _sm_major >= 9:
+                    self.amp_dtype = torch.bfloat16
+                    self.use_fp8 = True
+                    params['use_transformer_engine'] = True
+                    logging.info("FP8 via Transformer Engine enabled (BF16 accumulation, SM %d.x) — TE layers active", _sm_major)
+                else:
+                    self.amp_dtype = torch.bfloat16
+                    logging.warning("FP8 requested but GPU SM %d.x < 9.0 (need Hopper/Blackwell); falling back to BF16", _sm_major)
+            else:
+                self.amp_dtype = torch.bfloat16
+                if not _te_available:
+                    logging.warning("FP8 requested but transformer_engine is not installed; falling back to BF16")
+                else:
+                    logging.warning("FP8 requested but no CUDA device available; falling back to BF16")
         else:
             # H100 strongly prefers BF16
             if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
@@ -258,7 +321,7 @@ class Trainer():
         # Model + integrator
         self.mask_bool, self.land_mask = self.get_land_mask_bool()
         self.model = self.get_model()
-        self.scaler = GradScaler(enabled=(torch.cuda.is_available() and self.amp_dtype == torch.float16))
+        self.scaler = GradScaler(enabled=(torch.cuda.is_available() and self.amp_dtype == torch.float16 and not getattr(self, 'use_fp8', False)))
 
         # >>> create optimizer BEFORE scheduler (and before resume)
         self.optimizer = self.get_optimizer()
@@ -346,9 +409,13 @@ class Trainer():
             except Exception:
                 pass
         
+        # Training keeps inputs at batch B (ensemble members are sampled at the model's
+        # latent bottleneck), so it uses the un-expanded boundary. Validation still
+        # expands its inputs to B*E and needs the expanded copy.
+        self.constant_boundary_data_ens = self.constant_boundary_data
         if params.num_ensemble_members > 1:
-            self.constant_boundary_data = to_ensemble_batch(self.constant_boundary_data, params.num_ensemble_members)
-            logging.info('Ensemble Mode. Ensemble size = {params.num_ensemble_members}\n')
+            self.constant_boundary_data_ens = to_ensemble_batch(self.constant_boundary_data, params.num_ensemble_members)
+            logging.info(f'Ensemble Mode. Ensemble size = {params.num_ensemble_members}\n')
 
         climatology_path = os.path.join(params.data_dir, self.params.climatology_file)
         self.climatology = xr.open_dataset(climatology_path).rename({'time': 'dayofyear'})
@@ -359,8 +426,34 @@ class Trainer():
             self.lat_weight_2d = _lat_w.view(1, 1, -1, 1)          # [1,1,H,1]
             self.lat_weight_3d = _lat_w.view(1, 1, 1, -1, 1)       # [1,1,1,H,1]
 
+        # Device-resident copies of the de-normalization stats. The dataset's
+        # inv_transforms keep mean/std on CPU (they are also used inside the
+        # loader workers), which forced validation to copy every rollout step
+        # to host before de-normalizing. With these, inv-transforms run on GPU
+        # and one D2H copy happens per batch instead of one per step.
+        vd = self.valid_dataset
+        self._sfc_std_d = vd.surface_std.to(self.device).reshape(1, -1, 1, 1)
+        self._sfc_mean_d = vd.surface_mean.to(self.device).reshape(1, -1, 1, 1)
+        self._ua_std_d = vd.upper_air_std.to(self.device).reshape(1, len(vd.upper_air_variables), -1, 1, 1)
+        self._ua_mean_d = vd.upper_air_mean.to(self.device).reshape(1, len(vd.upper_air_variables), -1, 1, 1)
+        if self.params.has_diagnostic:
+            self._diag_std_d = vd.diagnostic_std.to(self.device).reshape(1, -1, 1, 1)
+            self._diag_mean_d = vd.diagnostic_mean.to(self.device).reshape(1, -1, 1, 1)
+
         if world_rank == 0:
             logging.info('rank %d, data loader initialized', self.world_rank)
+
+    # GPU versions of the dataset inv_transforms (same math, device-resident
+    # stats). Broadcasting aligns trailing dims, so they accept both single
+    # states [B, C, ...] and stacked trajectories [B, T, C, ...].
+    def surface_inv_gpu(self, x):
+        return x * self._sfc_std_d + self._sfc_mean_d
+
+    def upper_air_inv_gpu(self, x):
+        return x * self._ua_std_d + self._ua_mean_d
+
+    def diagnostic_inv_gpu(self, x):
+        return x * self._diag_std_d + self._diag_mean_d
 
     def init_wandb(self, params:dict):
         if params.log_to_wandb:
@@ -750,17 +843,22 @@ class Trainer():
                     data_time += time.time() - data_start
 
                     tr_start = time.time()
+                    # Gradients are zeroed only at the start of each accumulation
+                    # window; the accum_steps micro-batches in between add into
+                    # the same .grad buffers, emulating a larger batch.
                     _accum_steps = max(1, int(getattr(self.params, "accum_steps", 1)))
                     if (i % _accum_steps) == 0:
                         self.optimizer.zero_grad(set_to_none=True)
 
-                    # forward + loss
+                    # forward + loss (AMP autocast inside cal_loss)
                     output_surface, output_upper_air, output_diagnostic, loss_sfc, loss_pl, loss_diagnostic, loss_vae, loss = self.cal_loss(
                         input_surface, self.constant_boundary_data, varying_boundary_data, input_upper_air,
                         target_diagnostic, target_surface, target_upper_air
                     )
 
-                    # accumulation with no_sync + optional grad clipping
+                    # Backward: on non-final micro-batches, DDP's no_sync skips the
+                    # gradient all-reduce; comms happen once per optimizer step.
+                    # scaler is a no-op under BF16 (only enabled for FP16).
                     _is_last_micro = ((i + 1) % _accum_steps == 0) or (i == len(train_data_loader) - 1)
                     if dist.is_initialized() and hasattr(self.model, "no_sync") and not _is_last_micro:
                         _sync_cm = self.model.no_sync()
@@ -782,10 +880,16 @@ class Trainer():
                     if (self.world_rank == 0) and (i % (5 * log_every) == 0):
                         logging.info(f"Backprop + step took {tr_end_time - tr_start:.4f}s")
 
-                    # Compute metrics only every N steps to reduce overhead
+                    # Diagnostics (not part of the objective): per-variable
+                    # latitude-weighted RMSE in normalized units, computed only
+                    # every metrics_every steps to keep the hot loop cheap.
                     if (i % metrics_every == 0):
                         with torch.inference_mode():
                             if self.params.predict_delta:
+                                # Outputs/targets are [B*E]; inputs stayed at [B]
+                                if self.params.num_ensemble_members > 1:
+                                    input_surface = to_ensemble_batch(input_surface, self.params.num_ensemble_members)
+                                    input_upper_air = to_ensemble_batch(input_upper_air, self.params.num_ensemble_members)
                                 output_surface, output_upper_air = self.integrator(input_surface, input_upper_air, output_surface, output_upper_air)
                                 target_surface_int, target_upper_air_int = self.integrator(input_surface, input_upper_air, target_surface, target_upper_air)
                             else:
@@ -848,14 +952,28 @@ class Trainer():
                 lambda x: x.to(self.device, dtype=torch.float32, non_blocking=True), data)
 
         if self.params.num_ensemble_members > 1:
+            # Only targets are expanded to [B*E] (the CRPS loss consumes one copy per
+            # member). Inputs stay at [B]: the model runs its encoders once per sample
+            # and samples E ensemble members at the latent bottleneck.
+            target_surface = to_ensemble_batch(target_surface, params.num_ensemble_members)
+            target_upper_air = to_ensemble_batch(target_upper_air, params.num_ensemble_members)
             if self.params.has_diagnostic:
-                ensemble_batches = [to_ensemble_batch(temp_batch, params.num_ensemble_members) for temp_batch in
-                                    [input_surface, input_upper_air, target_surface, target_upper_air, target_diagnostic, varying_boundary_data]]
-                input_surface, input_upper_air, target_surface, target_upper_air, target_diagnostic, varying_boundary_data = ensemble_batches
-            else:
-                ensemble_batches = [to_ensemble_batch(temp_batch, params.num_ensemble_members) for temp_batch in
-                                    [input_surface, input_upper_air, target_surface, target_upper_air, varying_boundary_data]]
-                input_surface, input_upper_air, target_surface, target_upper_air, varying_boundary_data = ensemble_batches
+                target_diagnostic = to_ensemble_batch(target_diagnostic, params.num_ensemble_members)
+
+        # Optional channels-last layout (params.use_channels_last): keeps the
+        # patch-embedding convs in NHWC and avoids cuDNN's nchw<->nhwc
+        # conversion kernels. 4D tensors -> channels_last, 5D -> channels_last_3d.
+        if getattr(self.params, 'use_channels_last', False) and torch.cuda.is_available():
+            cl, cl3 = torch.channels_last, torch.channels_last_3d
+            input_surface = input_surface.to(memory_format=cl)
+            input_upper_air = input_upper_air.to(memory_format=cl3)
+            target_surface = target_surface.to(memory_format=cl)
+            target_upper_air = target_upper_air.to(memory_format=cl3)
+            if isinstance(target_diagnostic, torch.Tensor):
+                target_diagnostic = target_diagnostic.to(memory_format=cl)
+            if isinstance(varying_boundary_data, torch.Tensor):
+                varying_boundary_data = varying_boundary_data.to(
+                    memory_format=cl if varying_boundary_data.dim() == 4 else cl3)
 
         return input_surface, input_upper_air, target_surface, target_upper_air, target_diagnostic, varying_boundary_data
 
@@ -863,22 +981,33 @@ class Trainer():
                  target_diagnostic, target_surface, target_upper_air, **kwargs):
         output_surface = output_upper_air = output_diagnostic = 0
         loss = loss_diagnostic = loss_pl = loss_sfc = loss_vae = 0
-        with autocast(device_type="cuda",
+        _E = int(self.params.num_ensemble_members)
+        # Targets arrive expanded to [B*E] for the loss; the model only needs one copy
+        # per sample ([::E] keeps sample order) so encoder 2 runs at batch B. The model
+        # samples E ensemble members at the latent bottleneck and returns [B*E] outputs.
+        _target_surface_in = target_surface[::_E] if _E > 1 else target_surface
+        _target_upper_air_in = target_upper_air[::_E] if _E > 1 else target_upper_air
+        _fp8_cm = te.fp8_autocast() if (self.use_fp8 and _te_available and te is not None) else contextlib.nullcontext()
+        with _fp8_cm, autocast(device_type="cuda",
                       dtype=self.amp_dtype if torch.cuda.is_available() else torch.float32,
                       enabled=torch.cuda.is_available() and self.amp_dtype != torch.float32):
             if self.params.has_diagnostic:
                 output_surface, output_upper_air, output_diagnostic, mu, sigma, mu2, sigma2 = self.model(
                     input_surface, self.constant_boundary_data, varying_boundary_data, input_upper_air,
-                    target_surface, target_upper_air, train=True)
+                    _target_surface_in, _target_upper_air_in, train=True, num_ensemble_members=_E)
                 loss_diagnostic = self.loss_obj_diagnostic(output_diagnostic, target_diagnostic)
             else:
                 output_surface, output_upper_air, mu, sigma, mu2, sigma2 = self.model(
                     input_surface, self.constant_boundary_data, varying_boundary_data, input_upper_air,
-                    target_surface, target_upper_air, train=True)
+                    _target_surface_in, _target_upper_air_in, train=True, num_ensemble_members=_E)
 
             loss_sfc = self.loss_obj_sfc(output_surface, target_surface)
             loss_pl = self.loss_obj_pl(output_upper_air, target_upper_air)
 
+            # Objective: upper-air reconstruction at full weight, surface
+            # (+ diagnostic) down-weighted by 0.25 (Pangu-Weather's weighting),
+            # plus the CVAE KL term KL(N(mu,sigma) || N(mu2,sigma2)) scaled by
+            # vae_loss_weight when enabled.
             if self.params.has_diagnostic:
                 loss = (loss_sfc + loss_diagnostic) * 0.25 + loss_pl
             else:
@@ -895,8 +1024,9 @@ class Trainer():
         # Optional grad stats (expensive)
         g_every = int(getattr(self.params, 'grad_stats_every', 0) or 0)
         if g_every > 0 and step is not None and (step % g_every == 0):
-            diagnostic_logs['batch_grad_norm'] = torch.tensor([grad_norm(self.model)], device=self.device, dtype=torch.float32)
-            diagnostic_logs['batch_grad_max']  = torch.tensor([grad_max(self.model)], device=self.device, dtype=torch.float32)
+            _gnorm, _gmax = grad_norm_and_max(self.model)
+            diagnostic_logs['batch_grad_norm'] = _gnorm.to(self.device, dtype=torch.float32)
+            diagnostic_logs['batch_grad_max'] = _gmax.to(self.device, dtype=torch.float32)
 
         # Always carry forward the tensors we need to all_reduce
         for key, value in kwargs.items():
@@ -916,24 +1046,27 @@ class Trainer():
                 for k, level in enumerate(current_dataset.levels):
                     diagnostic_logs[f'train_{var}_level{level:.4f}_lwrmse'] = torch.mean(upper_air_lwrmse[:, j, k]) * current_dataset.upper_air_std[j, k]
 
-        if dist.is_initialized():
-            for key in sorted(list(diagnostic_logs.keys())):
-                if key == 'batch_grad_max':
-                    grad_max_tensor = torch.zeros(dist.get_world_size(), dtype=torch.float32, device=self.device)
-                    dist.all_gather_into_tensor(grad_max_tensor, diagnostic_logs[key])
-                    diagnostic_logs[key] = torch.max(grad_max_tensor)
-                else:
-                    val = diagnostic_logs[key]
-                    if not isinstance(val, torch.Tensor):
-                        val = torch.tensor(val, device=self.device, dtype=torch.float32)
-                    dist.all_reduce(val)
-                    diagnostic_logs[key] = float(val / dist.get_world_size())
-        else:
-            # Convert to float for single-GPU case
-            for key in list(diagnostic_logs.keys()):
-                val = diagnostic_logs[key]
-                if isinstance(val, torch.Tensor):
-                    diagnostic_logs[key] = float(val.item())
+        # Communication/sync happens once per call, not once per key: all fresh
+        # tensor metrics are packed into one tensor for a single all_reduce and
+        # a single D2H copy (previously ~100 keys each paid an all_reduce plus
+        # a float() sync). Keys already reduced to float on an earlier call
+        # (e.g. stale grad stats between grad_stats_every hits) are left alone
+        # instead of being re-reduced.
+        keys = sorted(diagnostic_logs.keys())
+        avg_keys = [k for k in keys if k != 'batch_grad_max' and isinstance(diagnostic_logs[k], torch.Tensor)]
+        if avg_keys:
+            packed = torch.stack([diagnostic_logs[k].detach().to(self.device, dtype=torch.float32).reshape(-1)[0]
+                                  for k in avg_keys])
+            if dist.is_initialized():
+                dist.all_reduce(packed)
+                packed = packed / dist.get_world_size()
+            for k, v in zip(avg_keys, packed.tolist()):
+                diagnostic_logs[k] = v
+        if isinstance(diagnostic_logs.get('batch_grad_max'), torch.Tensor):
+            gmax = diagnostic_logs['batch_grad_max'].detach().reshape(-1)[0].clone()
+            if dist.is_initialized():
+                dist.all_reduce(gmax, op=dist.ReduceOp.MAX)
+            diagnostic_logs['batch_grad_max'] = float(gmax)
         return diagnostic_logs
 
     def diagnostic_log_per_epoch(self, diagnostic_logs, train_loss, epoch, **kwargs)->dict:
@@ -965,6 +1098,9 @@ class Trainer():
             return logs
 
     def inti_valid_loss(self, lead_times_steps) -> tuple:
+        # valid_buff packs the scalar accumulators (loss, sfc, pl, [diag],
+        # batch count) into ONE tensor so a single all_reduce syncs them all;
+        # the named variables below are views aliasing into it.
         if self.params.has_diagnostic:
             valid_buff = torch.zeros((5), dtype=torch.float32, device=self.device)
             valid_loss_diag = valid_buff[3].view(-1)
@@ -994,6 +1130,17 @@ class Trainer():
         return valid_loss_diag, valid_buff, valid_loss, valid_loss_sfc, valid_loss_pl, valid_steps, valid_surface_lwrmse, valid_upper_air_lwrmse, valid_diagnostic_lwrmse, multi_step_losses, multi_step_rmse
 
     def validate_one_epoch(self):
+        """Autoregressive rollout validation.
+
+        Each validation sample is stepped max(forecast_lead_times) times, with
+        every prediction fed back as the next input (the deployment regime,
+        unlike the single-step training objective). Loss and lat-weighted RMSE
+        are accumulated only at the configured lead times; the full
+        denormalized trajectory is kept on CPU for the ACC-vs-climatology,
+        power-spectrum, and GIF diagnostics. Note: unlike training, ensemble
+        mode expands the INPUTS to B*E here, so each member rolls out its own
+        trajectory from the shared initial condition.
+        """
         if world_rank == 0:
             print("Validating...")
         self.model.eval()
@@ -1049,43 +1196,38 @@ class Trainer():
                         val_input_surface, val_input_upper_air, val_target_surface, val_target_upper_air, \
                         val_varying_boundary_data = ensemble_batches
 
-                # start times per sample
-                start_times = []
-                for i2 in range(times.shape[0]):
-                    start_time = self.valid_dataset.datetime_class(times[i2,0].item(), times[i2,1].item(), times[i2,2].item(), hour=times[i2,3].item())
-                    start_times.append(start_time)
+                # Start times per sample: one D2H copy for the whole tensor
+                # instead of 4 x batch_size .item() syncs.
+                times_cpu = times.cpu().numpy().astype(int)
+                start_times = [
+                    self.valid_dataset.datetime_class(times_cpu[i2, 0], times_cpu[i2, 1], times_cpu[i2, 2], hour=times_cpu[i2, 3])
+                    for i2 in range(times_cpu.shape[0])
+                ]
 
                 max_lead_time = max(lead_times_steps)
 
-                # ACC tensors (all time steps)
-                val_output_surface_acc = np.zeros((val_input_surface.shape[0], max_lead_time,
-                                                   val_input_surface.shape[1], val_input_surface.shape[2], val_input_surface.shape[3]), dtype=np.float32)
-                val_output_upper_air_acc = np.zeros((val_input_upper_air.shape[0], max_lead_time,
-                                                     val_input_upper_air.shape[1], val_input_upper_air.shape[2],
-                                                     val_input_upper_air.shape[3], val_input_upper_air.shape[4]), dtype=np.float32)
-                if self.params.has_diagnostic:
-                    val_output_diagnostic_acc = np.zeros((val_target_diagnostic.shape[0], max_lead_time,
-                                                          val_target_diagnostic.shape[2], val_target_diagnostic.shape[3],
-                                                          val_target_diagnostic.shape[4]), dtype=np.float32)
-                    val_output_diagnostic_t = np.zeros((val_target_diagnostic.shape[0], len(lead_times_steps),
-                                                        val_target_diagnostic.shape[2], val_target_diagnostic.shape[3],
-                                                        val_target_diagnostic.shape[4]), dtype=np.float32)
-
-                # tensors for selected lead times
-                val_output_surface_t = np.zeros((val_input_surface.shape[0], len(lead_times_steps),
-                                                 val_input_surface.shape[1], val_input_surface.shape[2], val_input_surface.shape[3]), dtype=np.float32)
-                val_output_upper_air_t = np.zeros((val_input_upper_air.shape[0], len(lead_times_steps),
-                                                   val_input_upper_air.shape[1], val_input_upper_air.shape[2],
-                                                   val_input_upper_air.shape[3], val_input_upper_air.shape[4]), dtype=np.float32)
+                # Trajectory buffers are GPU lists, allocated only when the
+                # corresponding diagnostic is enabled. De-normalization and the
+                # D2H copy happen once per batch on the stacked trajectory
+                # instead of once per rollout step.
+                _need_traj = self.params.diagnostic_acc or self.params.diagnostic_gif  # full trajectory (ACC/GIF)
+                _need_spectra = self.params.diagnostic_spectra                         # selected lead times only
+                if _need_traj:
+                    _surf_steps_gpu, _ua_steps_gpu, _diag_steps_gpu = [], [], []
+                if _need_spectra:
+                    _surf_t_gpu, _ua_t_gpu, _diag_t_gpu = [], [], []
 
                 step_idx = 0
+                # Rollout: one forward = one timedelta_hours step. Constant
+                # boundaries are reused; varying boundaries (TOA solar) are
+                # indexed per step since they follow the forecast time.
                 for step in range(max_lead_time):
                     if self.params.has_diagnostic:
                         val_output_surface, val_output_upper_air, val_output_diagnostic, _, _  = self.model(
-                            val_input_surface, self.constant_boundary_data, val_varying_boundary_data[:, step], val_input_upper_air)
+                            val_input_surface, self.constant_boundary_data_ens, val_varying_boundary_data[:, step], val_input_upper_air)
                     else:
                         val_output_surface, val_output_upper_air,  _, _ = self.model(
-                            val_input_surface, self.constant_boundary_data, val_varying_boundary_data[:, step], val_input_upper_air)
+                            val_input_surface, self.constant_boundary_data_ens, val_varying_boundary_data[:, step], val_input_upper_air)
 
                     if (step + 1) in lead_times_steps:
                         target_index = step
@@ -1110,12 +1252,15 @@ class Trainer():
                                 valid_loss_diag += loss_diag
 
                     if self.params.predict_delta:
+                        # Convert the predicted (normalized) increment into a full
+                        # state before scoring RMSE and feeding it back as input.
                         val_output_surface, val_output_upper_air = self.integrator(val_input_surface, val_input_upper_air, val_output_surface, val_output_upper_air)
 
-                    val_output_surface_acc[:, step] = self.valid_dataset.surface_inv_transform(val_output_surface.cpu()).numpy()
-                    val_output_upper_air_acc[:, step] = self.valid_dataset.upper_air_inv_transform(val_output_upper_air.cpu()).numpy()
-                    if self.params.has_diagnostic:
-                        val_output_diagnostic_acc[:, step] = self.valid_dataset.diagnostic_inv_transform(val_output_diagnostic.cpu()).numpy()
+                    if _need_traj:
+                        _surf_steps_gpu.append(val_output_surface)
+                        _ua_steps_gpu.append(val_output_upper_air)
+                        if self.params.has_diagnostic:
+                            _diag_steps_gpu.append(val_output_diagnostic)
 
                     if (step + 1) in lead_times_steps:
                         # Use pre-computed weights
@@ -1125,7 +1270,8 @@ class Trainer():
                             rmse_diag = weighted_rmse_torch_channels(val_output_diagnostic, val_target_diagnostic[:, target_index], weight=self.lat_weight_2d)
                             multi_step_rmse[f"valid_lwrmse_diag_{step+1}step"] += torch.mean(rmse_diag)
                             valid_diagnostic_lwrmse[step_idx] += torch.mean(rmse_diag, dim=0)
-                            val_output_diagnostic_t[:, step_idx] = self.valid_dataset.diagnostic_inv_transform(val_output_diagnostic.cpu()).numpy()
+                            if _need_spectra:
+                                _diag_t_gpu.append(val_output_diagnostic)
 
                         multi_step_rmse[f"valid_lwrmse_sfc_{step+1}step"] += torch.mean(rmse_sfc)
                         multi_step_rmse[f"valid_lwrmse_pl_{step+1}step"] += torch.mean(rmse_pl)
@@ -1133,43 +1279,52 @@ class Trainer():
                         valid_surface_lwrmse[step_idx] += torch.mean(rmse_sfc, dim=0)
                         valid_upper_air_lwrmse[step_idx] += torch.mean(rmse_pl, dim=0)
 
-                        val_output_surface_t[:, step_idx] = self.valid_dataset.surface_inv_transform(val_output_surface.cpu()).numpy()
-                        val_output_upper_air_t[:, step_idx] = self.valid_dataset.upper_air_inv_transform(val_output_upper_air.cpu()).numpy()
+                        if _need_spectra:
+                            _surf_t_gpu.append(val_output_surface)
+                            _ua_t_gpu.append(val_output_upper_air)
 
                         if step + 1 == max_lead_time:
-                            # ACC prep
-                            if self.params.diagnostic_acc or self.params.diagnostic_gif:
+                            # ACC prep: inv-transform the stacked trajectory on
+                            # GPU, then one D2H copy for the whole rollout.
+                            if _need_traj:
+                                val_output_surface_acc = self.surface_inv_gpu(torch.stack(_surf_steps_gpu, dim=1)).cpu().numpy()
+                                val_output_upper_air_acc = self.upper_air_inv_gpu(torch.stack(_ua_steps_gpu, dim=1)).cpu().numpy()
                                 if self.params.has_diagnostic:
+                                    val_output_diagnostic_acc = self.diagnostic_inv_gpu(torch.stack(_diag_steps_gpu, dim=1)).cpu().numpy()
                                     acc_datasets = self.convert_to_xarray(val_output_surface_acc, val_output_upper_air_acc, start_times, self.params, self.valid_dataset, acc=True, diagnostic_prediction=val_output_diagnostic_acc)
                                 else:
                                     acc_datasets = self.convert_to_xarray(val_output_surface_acc, val_output_upper_air_acc, start_times, self.params, self.valid_dataset, acc=True)
                                 acc_prepared = [self.prepare_preds(ds, acc=True) for ds in acc_datasets]
                                 acc_predictions.append(self.combine_datasets(acc_prepared))
 
-                                acc_gt_surface = self.valid_dataset.surface_inv_transform(val_target_surface.cpu()).numpy()
-                                acc_gt_upper_air = self.valid_dataset.upper_air_inv_transform(val_target_upper_air.cpu()).numpy()
+                                acc_gt_surface = self.surface_inv_gpu(val_target_surface).cpu().numpy()
+                                acc_gt_upper_air = self.upper_air_inv_gpu(val_target_upper_air).cpu().numpy()
                                 if self.params.has_diagnostic:
-                                    acc_gt_diagnostic = self.valid_dataset.diagnostic_inv_transform(val_target_diagnostic.cpu()).numpy()
+                                    acc_gt_diagnostic = self.diagnostic_inv_gpu(val_target_diagnostic).cpu().numpy()
                                     acc_gt_datasets = self.convert_to_xarray(acc_gt_surface, acc_gt_upper_air, start_times, self.params, self.valid_dataset, acc=True, diagnostic_prediction=acc_gt_diagnostic)
                                 else:
                                     acc_gt_datasets = self.convert_to_xarray(acc_gt_surface, acc_gt_upper_air, start_times, self.params, self.valid_dataset, acc=True)
                                 acc_gt_prepared = [self.prepare_preds(ds, acc=True) for ds in acc_gt_datasets]
                                 acc_ground_truths.append(self.combine_datasets(acc_gt_prepared))
 
-                            # Spectra prep
+                            # Spectra prep (selected lead times only), same
+                            # GPU-side inv-transform + single-copy pattern.
                             lead_time_indices = [lt - 1 for lt in self.params.forecast_lead_times]
-                            if self.params.diagnostic_spectra:
+                            if _need_spectra:
+                                val_output_surface_t = self.surface_inv_gpu(torch.stack(_surf_t_gpu, dim=1)).cpu().numpy()
+                                val_output_upper_air_t = self.upper_air_inv_gpu(torch.stack(_ua_t_gpu, dim=1)).cpu().numpy()
                                 if self.params.has_diagnostic:
+                                    val_output_diagnostic_t = self.diagnostic_inv_gpu(torch.stack(_diag_t_gpu, dim=1)).cpu().numpy()
                                     datasets = self.convert_to_xarray(val_output_surface_t, val_output_upper_air_t, start_times, self.params, self.valid_dataset, acc=False, diagnostic_prediction=val_output_diagnostic_t)
                                 else:
                                     datasets = self.convert_to_xarray(val_output_surface_t, val_output_upper_air_t, start_times, self.params, self.valid_dataset, acc=False)
                                 prepared_datasets = [self.prepare_preds(ds, acc=False) for ds in datasets]
                                 all_predictions.append(self.combine_datasets(prepared_datasets))
 
-                                gt_surface = self.valid_dataset.surface_inv_transform(val_target_surface[:, lead_time_indices].cpu()).numpy()
-                                gt_upper_air = self.valid_dataset.upper_air_inv_transform(val_target_upper_air[:, lead_time_indices].cpu()).numpy()
+                                gt_surface = self.surface_inv_gpu(val_target_surface[:, lead_time_indices]).cpu().numpy()
+                                gt_upper_air = self.upper_air_inv_gpu(val_target_upper_air[:, lead_time_indices]).cpu().numpy()
                                 if self.params.has_diagnostic:
-                                    gt_diagnostic = self.valid_dataset.diagnostic_inv_transform(val_target_diagnostic[:, lead_time_indices].cpu()).numpy()
+                                    gt_diagnostic = self.diagnostic_inv_gpu(val_target_diagnostic[:, lead_time_indices]).cpu().numpy()
                                     gt_datasets = self.convert_to_xarray(gt_surface, gt_upper_air, start_times, self.params, self.valid_dataset, acc=False, diagnostic_prediction=gt_diagnostic)
                                 else:
                                     gt_datasets = self.convert_to_xarray(gt_surface, gt_upper_air, start_times, self.params, self.valid_dataset, acc=False)
@@ -1177,6 +1332,8 @@ class Trainer():
                                 all_ground_truths.append(self.combine_datasets(gt_prepared))
                         step_idx += 1
 
+                    # Autoregressive feedback: this step's prediction becomes
+                    # the next step's input state.
                     val_input_surface, val_input_upper_air = val_output_surface, val_output_upper_air
 
                 del val_output_surface, val_output_upper_air, val_input_surface, val_input_upper_air, val_target_surface, val_target_upper_air
@@ -1419,6 +1576,9 @@ class Trainer():
         
         self.iters = checkpoint['iters']
         self.startEpoch = checkpoint['epoch']
+        # Keep the epoch counter in sync: train_one_epoch increments self.epoch,
+        # so without this a resumed run would log epochs starting from 1 again.
+        self.epoch = self.startEpoch
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scheduler_state_dict' in checkpoint:
@@ -1462,7 +1622,7 @@ if __name__ == '__main__':
     parser.add_argument("--ddp-powersgd", action="store_true", help="Enable PowerSGD gradient compression (may affect accuracy)")
     parser.add_argument("--ddp-fp16-compress", action="store_true", help="Enable FP16 gradient compression")
     parser.add_argument("--powersgd-rank", default=1, type=int, help="PowerSGD low-rank size")
-    parser.add_argument("--amp-dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32"], help="AMP compute dtype (bf16 recommended for H100)")
+    parser.add_argument("--amp-dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32", "fp8"], help="AMP compute dtype (bf16 recommended for H100/B300; fp8 requires transformer_engine on Hopper/Blackwell)")
     parser.add_argument("--log-every-n-steps", default=20, type=int, help="Throttle per-step logging/W&B to every N steps (1 = log every step)")
     parser.add_argument("--metrics-every", default=100, type=int, help="Compute per-step metrics (RMSE etc.) every N steps; 0 = disable")
     parser.add_argument("--grad-stats-every", default=0, type=int, help="Compute grad norm / max every N steps; 0 = disable")
