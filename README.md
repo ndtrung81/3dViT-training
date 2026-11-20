@@ -370,3 +370,19 @@ WANDB_MODE=offline
 - [ ] **Multi-node support** — Extend optimizations for multi-node training
 - [ ] **Dynamic batching** — Adjust batch size based on available memory (especially with B300's 288GB)
 - [ ] **Profiler-guided compile** — Use profiling data to inform `torch.compile` decisions
+
+## Citation
+
+```bibtex
+@article{zand2026blackwell,
+  author        = {Zand, Mohsen and Nguyen, Trung Dac and Runesha, H. Birali},
+  title         = {Matching Workloads to Blackwell: Power-Resolved Benchmarking of
+                   {NVIDIA} {B200} and {B300} across {HPC} and {AI} Workloads},
+  journal       = {arXiv preprint arXiv:2610.41919},
+  year          = {2026},
+  eprint        = {2610.41919},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.DC},
+  url           = {https://arxiv.org/abs/2610.41919}
+}
+```
